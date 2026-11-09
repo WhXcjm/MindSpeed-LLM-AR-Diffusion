@@ -104,6 +104,7 @@ def _prompt_block_attention_mask(
     for row in range(batch_size):
         valid = prompt_attention_mask[row].nonzero(as_tuple=True)[0]
         if valid.numel() == 0:
+            allowed[row].fill_diagonal_(True)
             continue
         valid_start = int(valid[0].item())
         if not prompt_attention_mask[row, valid_start:].all().item():
@@ -126,6 +127,29 @@ def _prompt_block_attention_mask(
     return mask
 
 
+def _split_prompt_for_rollout(prompt_ids, prompt_lengths, block_size, mask_token_id):
+    """Left-pad complete prefix blocks and keep each row's tail in block zero."""
+    device = prompt_ids.device
+    prompt_width = prompt_ids.shape[1]
+    tail_lengths = prompt_lengths.remainder(block_size)
+    prefix_lengths = prompt_lengths - tail_lengths
+    # Keep one masked dummy cache column when all local rows have empty prefill.
+    prefix_width = max(1, int(prefix_lengths.max().item()))
+    prefix_offsets = torch.arange(prefix_width, device=device) + (
+        prefix_lengths - prefix_width
+    ).unsqueeze(1)
+    prefix_valid = prefix_offsets.ge(0)
+    source_positions = (prompt_width - prompt_lengths).unsqueeze(1) + prefix_offsets
+    prefix_ids = prompt_ids.gather(1, source_positions.clamp(0, prompt_width - 1))
+
+    columns = torch.arange(block_size, device=device)
+    tail_positions = (prompt_width - tail_lengths).unsqueeze(1) + columns
+    first_mutable = columns >= tail_lengths.unsqueeze(1)
+    first_block = prompt_ids.gather(1, tail_positions.clamp(max=prompt_width - 1))
+    first_block.masked_fill_(first_mutable, mask_token_id)
+    return prefix_ids, prefix_valid, prefix_lengths, tail_lengths, first_block, first_mutable
+
+
 @torch.no_grad()
 def block_diffusion_rollout(
     model,
@@ -144,12 +168,14 @@ def block_diffusion_rollout(
     eos_token_id: int | None = None,
     prompt_attention_mask: torch.BoolTensor | None = None,
     sample_seeds: list[int] | None = None,
+    block_alignment: str = "response",
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
     """Generate responses and record each token's first reveal step.
 
     Ranks stop only when every trajectory across the FSDP group has emitted EOS,
     so all ranks execute the same number of student forwards. The configured
-    response length remains a hard curriculum cap.
+    response length remains a hard curriculum cap. Prompt alignment may decode
+    extra positions in the final physical block and discards them on return.
     """
 
     from transformers.cache_utils import DynamicCache
@@ -158,8 +184,11 @@ def block_diffusion_rollout(
         raise ValueError("prompt_ids must have shape [local_rollout_batch, prompt_length]")
     if response_tokens <= 0:
         raise ValueError("response_tokens must be positive")
+    if block_alignment not in {"response", "prompt"}:
+        raise ValueError("block_alignment must be response or prompt")
     device = prompt_ids.device
     batch_size, prompt_length = prompt_ids.shape
+    distributed = dist.is_initialized() and dist.get_world_size() > 1
     if prompt_attention_mask is None:
         prompt_attention_mask = torch.ones_like(prompt_ids, dtype=torch.bool)
     else:
@@ -169,6 +198,28 @@ def block_diffusion_rollout(
     prompt_lengths = prompt_attention_mask.sum(dim=-1)
     if (prompt_lengths <= 0).any().item():
         raise ValueError("every rollout prompt must contain at least one non-padding token")
+    prompt_aligned = block_alignment == "prompt"
+    if prompt_aligned:
+        valid_columns = torch.arange(prompt_length, device=device) >= (
+            prompt_length - prompt_lengths
+        ).unsqueeze(1)
+        if not torch.equal(valid_columns, prompt_attention_mask):
+            raise ValueError("rollout prompts must use contiguous left padding")
+        (
+            prompt_ids,
+            prompt_attention_mask,
+            prompt_lengths,
+            tail_lengths,
+            first_block,
+            first_mutable,
+        ) = _split_prompt_for_rollout(prompt_ids, prompt_lengths, block_size, mask_token_id)
+        prompt_length = prompt_ids.shape[1]
+        max_tail = tail_lengths.max().to(dtype=torch.int32)
+        if distributed:
+            dist.all_reduce(max_tail, op=dist.ReduceOp.MAX)
+        max_physical_tokens = response_tokens + int(max_tail.item())
+    else:
+        max_physical_tokens = response_tokens
     if sample_seeds is not None:
         if len(sample_seeds) != batch_size:
             raise ValueError("sample_seeds must contain one seed per rollout prompt")
@@ -212,23 +263,27 @@ def block_diffusion_rollout(
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
     generated = 0
     global_denoise_step = 0
-    num_blocks = math.ceil(response_tokens / block_size)
+    num_blocks = math.ceil(max_physical_tokens / block_size)
     for block_index in range(num_blocks):
-        current_length = min(block_size, response_tokens - generated)
-        block = torch.full(
-            (batch_size, current_length),
-            mask_token_id,
-            dtype=prompt_ids.dtype,
-            device=device,
+        current_length = (
+            block_size if prompt_aligned else min(block_size, response_tokens - generated)
         )
+        if prompt_aligned and block_index == 0:
+            block, mutable = first_block, first_mutable
+        else:
+            block = torch.full(
+                (batch_size, current_length), mask_token_id, dtype=prompt_ids.dtype, device=device
+            )
+            mutable = torch.ones_like(block, dtype=torch.bool)
         first_reveal = torch.zeros_like(block)
         steps = min(denoise_steps, current_length)
         schedule = _transfer_schedule(current_length, steps)
         block_start = prompt_length + generated
 
         for step_index in range(steps):
-            masked = block.eq(mask_token_id)
-            if not masked.any().item():
+            masked = mutable & block.eq(mask_token_id)
+            has_masked = bool(masked.any().item())
+            if not has_masked and not distributed:
                 break
             prefix_cache_length = cache.get_seq_length()
             logical_offsets = torch.arange(
@@ -256,7 +311,11 @@ def block_diffusion_rollout(
                 device=device,
             )
             attention_mask.masked_fill_(key_valid[:, None, None, :], 0)
-            denoise = model(
+            # FSDP ranks must enter the same root forwards even when a local
+            # batch completes its denoising rounds ahead of the other ranks.
+            denoise = _root_forward(
+                model,
+                lm_positions=None if has_masked else torch.zeros(1, device=device, dtype=torch.long),
                 input_ids=block,
                 attention_mask=attention_mask,
                 position_ids=positions,
@@ -266,6 +325,9 @@ def block_diffusion_rollout(
             )
             cache = denoise.past_key_values
             _crop_cache(cache, prefix_cache_length)
+            if not has_masked:
+                del denoise
+                continue
             logits = denoise.logits
             del denoise
             proposed, confidence = _sample(
@@ -297,7 +359,7 @@ def block_diffusion_rollout(
             first_reveal[update & first_reveal.eq(0)] = global_denoise_step
             block[update] = proposed[update]
 
-        if block.eq(mask_token_id).any().item() or first_reveal.eq(0).any().item():
+        if (mutable & (block.eq(mask_token_id) | first_reveal.eq(0))).any().item():
             raise RuntimeError(f"rollout block {block_index} did not fully denoise")
         response_blocks.append(block)
         reveal_blocks.append(first_reveal)
@@ -305,9 +367,15 @@ def block_diffusion_rollout(
 
         globally_finished = False
         if eos_token_id is not None:
-            finished |= block.eq(int(eos_token_id)).any(dim=1)
+            eos_in_response = block.eq(int(eos_token_id)) & mutable
+            if prompt_aligned:
+                response_offsets = torch.arange(
+                    generated - current_length, generated, device=device
+                ) - tail_lengths.unsqueeze(1)
+                eos_in_response &= response_offsets.lt(response_tokens)
+            finished |= eos_in_response.any(dim=1)
             all_finished = finished.all().to(dtype=torch.int32)
-            if dist.is_initialized():
+            if distributed:
                 dist.all_reduce(all_finished, op=dist.ReduceOp.MIN)
             globally_finished = bool(all_finished.item())
 
@@ -356,5 +424,17 @@ def block_diffusion_rollout(
 
     if was_training:
         model.train()
-    return torch.cat(response_blocks, dim=1), torch.cat(reveal_blocks, dim=1)
+    responses = torch.cat(response_blocks, dim=1)
+    reveals = torch.cat(reveal_blocks, dim=1)
+    if prompt_aligned:
+        width = min(response_tokens, generated)
+        indices = tail_lengths.unsqueeze(1) + torch.arange(width, device=device)
+        valid = indices.lt(generated)
+        indices = indices.clamp(max=generated - 1)
+        responses, reveals = responses.gather(1, indices), reveals.gather(1, indices)
+        if globally_finished:
+            # Every row already has a real EOS. Rectangular padding is removed
+            # at the first EOS by the trainer before any target is built.
+            responses.masked_fill_(~valid, int(eos_token_id))
+    return responses, reveals
 

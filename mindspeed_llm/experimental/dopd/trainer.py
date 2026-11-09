@@ -281,6 +281,8 @@ class DOPDTrainer:
         requested_context = (
             self.dopd_args.prompt_tokens + 2 * self.dopd_args.max_response_tokens
         )
+        if self.dopd_args.block_alignment == "prompt":
+            requested_context += self.dopd_args.block_size - 1
         if max_positions is not None and requested_context > int(max_positions):
             raise ValueError(
                 f"d-OPD requests {requested_context} tokens but the model supports {max_positions}"
@@ -398,6 +400,11 @@ class DOPDTrainer:
         )
         if self.training_args.max_steps <= 0:
             raise ValueError("training.max_steps must be positive")
+        stop_after = self.dopd_args.stop_after_iteration
+        if stop_after is not None and stop_after > self.training_args.max_steps:
+            raise ValueError("dopd.stop_after_iteration cannot exceed training.max_steps")
+        if stop_after is not None and self.training_args.save_only_model:
+            raise ValueError("dopd.stop_after_iteration requires a complete training checkpoint")
         if self.parallel_args.fsdp_size != self.world_size:
             raise ValueError("d-OPD requires parallel.fsdp_size=WORLD_SIZE")
         if self.dopd_args.strict_paper_alignment:
@@ -545,12 +552,24 @@ class DOPDTrainer:
         state = {"model": self.student_engine, "optimizer": self.optimizer, "extra_state": {}}
         CheckpointManager.load(path, state)
         extra = state.get("extra_state", {})
-        self.global_step = int(extra.get("global_step", 0))
+        if "global_step" not in extra or "lr_scheduler" not in extra:
+            raise ValueError("resume_from_checkpoint requires a complete d-OPD training checkpoint")
+        for name, legacy_value in (
+            ("block_alignment", "response"),
+            ("loss_mask_mode", "newly_unmasked"),
+        ):
+            if extra.get(name, legacy_value) != getattr(self.dopd_args, name):
+                raise ValueError(f"resume checkpoint does not match dopd.{name}")
+        if extra.get("max_steps", self.training_args.max_steps) != self.training_args.max_steps:
+            raise ValueError("resume checkpoint does not match training.max_steps")
+        saved_inner_steps = extra.get("inner_steps_per_iteration", self.inner_steps_per_iteration)
+        if saved_inner_steps != self.inner_steps_per_iteration:
+            raise ValueError("resume checkpoint does not match optimizer steps per iteration")
+        self.global_step = int(extra["global_step"])
         self.optimizer_step = int(
             extra.get("optimizer_step", self.global_step * self.inner_steps_per_iteration)
         )
-        if "lr_scheduler" in extra:
-            self.scheduler.load_state_dict(extra["lr_scheduler"])
+        self.scheduler.load_state_dict(extra["lr_scheduler"])
         if "torch_rng_state" in extra:
             torch.set_rng_state(extra["torch_rng_state"])
         target_batches = int(
@@ -827,6 +846,7 @@ class DOPDTrainer:
             eos_token_id=self.tokenizer.eos_token_id,
             prompt_attention_mask=prompt_attention_mask,
             sample_seeds=sample_seeds,
+            block_alignment=self.dopd_args.block_alignment,
         )
         trajectory_seeds = sample_seeds or [
             (seed + index * self.world_size) % (2**31 - 1)
@@ -866,6 +886,9 @@ class DOPDTrainer:
             self.dopd_args.block_size,
             self.mask_token_id,
             random.Random(seed + 17),
+            prompt_length=prompt.shape[1],
+            block_alignment=self.dopd_args.block_alignment,
+            loss_mask_mode=self.dopd_args.loss_mask_mode,
         )
         valid = response_valid_mask(
             response[0],
@@ -907,6 +930,7 @@ class DOPDTrainer:
             score_chunk_size=self.dopd_args.score_chunk_size,
             cache_max_bytes=self.dopd_args.teacher_cache_max_bytes,
             future_valid_length=int(future_valid.sum().item()),
+            block_alignment=self.dopd_args.block_alignment,
         )
         return loss, stats, verification
 
@@ -924,12 +948,19 @@ class DOPDTrainer:
                 "data_batches_consumed": self.data_batches_consumed,
                 "lr_scheduler": self.scheduler.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
+                "block_alignment": self.dopd_args.block_alignment,
+                "loss_mask_mode": self.dopd_args.loss_mask_mode,
+                "max_steps": self.training_args.max_steps,
+                "inner_steps_per_iteration": self.inner_steps_per_iteration,
             },
         }
         CheckpointManager.save(
             path=str(path),
             state=state,
-            save_async=self.training_args.save_async,
+            save_async=(
+                self.training_args.save_async
+                and self.global_step != self.dopd_args.stop_after_iteration
+            ),
             save_only_model=self.training_args.save_only_model,
             global_steps=self.global_step,
         )
@@ -941,9 +972,13 @@ class DOPDTrainer:
         logger.info_rank0(f"> Saved d-OPD checkpoint to {path}")
 
     def train(self):
+        stop_after = self.dopd_args.stop_after_iteration or self.training_args.max_steps
+        if self.global_step >= stop_after:
+            logger.info_rank0(f"> d-OPD checkpoint already reached iteration {stop_after}")
+            return
         self.optimizer.zero_grad()
         start_time = time.time()
-        while self.global_step < self.training_args.max_steps:
+        while self.global_step < stop_after:
             iteration = self.global_step + 1
             response_tokens = cosine_response_length(
                 iteration,
@@ -1112,7 +1147,14 @@ class DOPDTrainer:
 
         if self.training_args.save_steps <= 0 or self.global_step % self.training_args.save_steps:
             self._save(final=True)
-        logger.info_rank0(f"> d-OPD finished in {time.time() - start_time:.1f}s")
+        elapsed = time.time() - start_time
+        if stop_after < self.training_args.max_steps:
+            logger.info_rank0(
+                f"> d-OPD stopped after iteration {self.global_step}/{self.training_args.max_steps} "
+                f"in {elapsed:.1f}s"
+            )
+        else:
+            logger.info_rank0(f"> d-OPD finished in {elapsed:.1f}s")
 
 
 def parse_args() -> Arguments:

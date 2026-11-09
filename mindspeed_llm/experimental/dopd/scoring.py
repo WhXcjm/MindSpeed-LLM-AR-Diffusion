@@ -13,6 +13,8 @@ from mindspeed_llm.fsdp2.models.qwen3.utils import set_diffusion_lm
 from .core import (
     apply_future_reweighting,
     build_dopd_attention_mask,
+    prompt_tail_length,
+    response_block_end,
     topk_forward_kl,
 )
 
@@ -173,6 +175,7 @@ def compute_dopd_loss(
     score_chunk_size: int,
     cache_max_bytes: int,
     future_valid_length: int | None = None,
+    block_alignment: str = "response",
 ) -> tuple[torch.Tensor, LossStats]:
     """Compute forward KL for one rank-local trajectory (micro-batch size 1)."""
 
@@ -189,7 +192,11 @@ def compute_dopd_loss(
     if future_valid_length is None:
         future_valid_length = response_length
     future_valid_length = max(0, min(int(future_valid_length), response_length))
-    student_input = torch.cat([prompt_ids, response_ids, noised_response], dim=1)
+    prompt_tail = prompt_tail_length(prompt_length, block_size, block_alignment)
+    prefill_length = prompt_length - prompt_tail
+    student_input = torch.cat(
+        [prompt_ids, response_ids, prompt_ids[:, prefill_length:], noised_response], dim=1
+    )
     model_dtype = next(student.parameters()).dtype
     attention_mask = build_dopd_attention_mask(
         prompt_length,
@@ -197,14 +204,12 @@ def compute_dopd_loss(
         block_size,
         dtype=model_dtype,
         device=student_input.device,
+        block_alignment=block_alignment,
     )
     clean_positions = torch.arange(
         prompt_length + response_length, device=student_input.device
     )
-    response_positions = torch.arange(
-        prompt_length, prompt_length + response_length, device=student_input.device
-    )
-    position_ids = torch.cat([clean_positions, response_positions]).unsqueeze(0)
+    position_ids = torch.cat([clean_positions, clean_positions[prefill_length:]]).unsqueeze(0)
 
     # The existing Qwen3 diffusion attention has a special equal-halves training
     # branch for Nemotron CPT. d-OPD uses [prompt, clean response, sampled state]
@@ -213,7 +218,7 @@ def compute_dopd_loss(
     student.eval()
     set_diffusion_lm(student, True)
     selected_positions = loss_mask[0].nonzero(as_tuple=True)[0]
-    noised_start = prompt_length + response_length
+    noised_start = prompt_length + response_length + prompt_tail
     projection_positions = noised_start + selected_positions
     if projection_positions.numel() == 0:
         projection_positions = torch.tensor([noised_start], device=student_input.device)
@@ -264,8 +269,9 @@ def compute_dopd_loss(
         relative_position = int(relative_position_tensor.item())
         absolute_position = prompt_length + relative_position
         teacher_target = base_teacher_log_probs[selected_index]
-        block_start = (relative_position // block_size) * block_size
-        block_end = min(block_start + block_size, future_valid_length)
+        block_end = response_block_end(
+            relative_position, future_valid_length, block_size, prompt_tail
+        )
         visible_future = noised_response[0, relative_position + 1 : block_end].ne(
             int(student.mask_token_id)
         )

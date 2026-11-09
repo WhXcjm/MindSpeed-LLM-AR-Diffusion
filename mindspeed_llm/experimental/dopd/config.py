@@ -67,6 +67,18 @@ class DOPDArguments:
         metadata={"help": "Expected global number of on-policy trajectories per optimizer update."},
     )
     block_size: int = field(default=4, metadata={"help": "Student block length."})
+    block_alignment: str = field(
+        default="response",
+        metadata={"help": "response starts a new block; prompt carries its tail into the first block."},
+    )
+    loss_mask_mode: str = field(
+        default="newly_unmasked",
+        metadata={"help": "Distill newly_unmasked or all remaining_mask positions in the sampled state."},
+    )
+    stop_after_iteration: Optional[int] = field(
+        default=None,
+        metadata={"help": "Save and stop after this outer iteration without changing the training horizon."},
+    )
     denoise_steps: int = field(default=4, metadata={"help": "Denoising steps per generated block."})
     temperature: float = field(default=1.0, metadata={"help": "Rollout sampling temperature."})
     top_k: int = field(default=0, metadata={"help": "Rollout top-k; zero disables filtering."})
@@ -146,6 +158,14 @@ class DOPDArguments:
                 raise ValueError(f"dopd.{name} must be a positive integer")
         if self.block_size < 2:
             raise ValueError("dopd.block_size must be at least 2 for future-aware correction")
+        if self.block_alignment not in {"response", "prompt"}:
+            raise ValueError("dopd.block_alignment must be response or prompt")
+        if self.loss_mask_mode not in {"newly_unmasked", "remaining_mask"}:
+            raise ValueError("dopd.loss_mask_mode must be newly_unmasked or remaining_mask")
+        if self.stop_after_iteration is not None and (
+            type(self.stop_after_iteration) is not int or self.stop_after_iteration <= 0
+        ):
+            raise ValueError("dopd.stop_after_iteration must be a positive integer or null")
         if self.min_response_tokens > self.max_response_tokens:
             raise ValueError("dopd.min_response_tokens cannot exceed dopd.max_response_tokens")
         if self.temperature < 0:
