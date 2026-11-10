@@ -79,6 +79,30 @@ class DOPDArguments:
         default=None,
         metadata={"help": "Save and stop after this outer iteration without changing the training horizon."},
     )
+    save_periodic_model_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "训练中按 training.save_steps 周期保存检查点时只写模型（跳过 optimizer 与 extra_state），"
+                "用于低成本备份；最终检查点与 dopd.save_latest_steps 产出的 latest 仍为全量。"
+            )
+        },
+    )
+    save_latest_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "每 N 轮把完整训练状态（模型/optimizer/scheduler/RNG）覆盖保存到 <output_dir>/latest，"
+                "中间过程为真实目录而非软链接；null 表示关闭。"
+            )
+        },
+    )
+    save_latest_final_symlink: bool = field(
+        default=False,
+        metadata={
+            "help": "训练到达 max_steps 时把 <output_dir>/latest 替换为指向最终全量检查点的软链接。"
+        },
+    )
     denoise_steps: int = field(default=4, metadata={"help": "Denoising steps per generated block."})
     temperature: float = field(default=1.0, metadata={"help": "Rollout sampling temperature."})
     top_k: int = field(default=0, metadata={"help": "Rollout top-k; zero disables filtering."})
@@ -166,6 +190,12 @@ class DOPDArguments:
             type(self.stop_after_iteration) is not int or self.stop_after_iteration <= 0
         ):
             raise ValueError("dopd.stop_after_iteration must be a positive integer or null")
+        if self.save_latest_steps is not None and (
+            type(self.save_latest_steps) is not int or self.save_latest_steps <= 0
+        ):
+            raise ValueError("dopd.save_latest_steps must be a positive integer or null")
+        if self.save_latest_final_symlink and self.save_latest_steps is None:
+            raise ValueError("dopd.save_latest_final_symlink requires dopd.save_latest_steps")
         if self.min_response_tokens > self.max_response_tokens:
             raise ValueError("dopd.min_response_tokens cannot exceed dopd.max_response_tokens")
         if self.temperature < 0:

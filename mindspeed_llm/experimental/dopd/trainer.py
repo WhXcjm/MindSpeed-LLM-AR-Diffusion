@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 import types
 from dataclasses import asdict, dataclass, field, fields
@@ -934,12 +935,8 @@ class DOPDTrainer:
         )
         return loss, stats, verification
 
-    def _save(self, final: bool = False):
-        name = f"global_step_{self.global_step}"
-        if final:
-            name = f"global_step_{self.global_step}_final"
-        path = self.output_dir / "checkpoints" / name
-        state = {
+    def _checkpoint_state(self) -> dict:
+        return {
             "model": self.student_engine,
             "optimizer": self.optimizer,
             "extra_state": {
@@ -954,22 +951,99 @@ class DOPDTrainer:
                 "inner_steps_per_iteration": self.inner_steps_per_iteration,
             },
         }
+
+    def _write_checkpoint_meta(self, path: Path, only_model: bool) -> None:
+        if self.rank != 0:
+            return
+        meta = {
+            "global_step": self.global_step,
+            "optimizer_step": self.optimizer_step,
+            "data_batches_consumed": self.data_batches_consumed,
+            "only_model": only_model,
+            "loss_mask_mode": self.dopd_args.loss_mask_mode,
+            "block_alignment": self.dopd_args.block_alignment,
+            "max_steps": self.training_args.max_steps,
+            "inner_steps_per_iteration": self.inner_steps_per_iteration,
+        }
+        (path / "dopd_checkpoint_meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _save(self, final: bool = False):
+        name = f"global_step_{self.global_step}"
+        if final:
+            name = f"global_step_{self.global_step}_final"
+        path = self.output_dir / "checkpoints" / name
+        # 周期备份可只存模型；最终检查点永远全量。
+        only_model = bool(self.dopd_args.save_periodic_model_only and not final)
+        state = self._checkpoint_state()
         CheckpointManager.save(
             path=str(path),
             state=state,
             save_async=(
                 self.training_args.save_async
+                and not only_model
                 and self.global_step != self.dopd_args.stop_after_iteration
             ),
-            save_only_model=self.training_args.save_only_model,
+            save_only_model=self.training_args.save_only_model or only_model,
             global_steps=self.global_step,
         )
+        dist.barrier()
+        self._write_checkpoint_meta(path, only_model)
         dist.barrier()
         cleanup_old_checkpoints(
             self.training_args,
             self.data_args.data_shared_file_system,
         )
         logger.info_rank0(f"> Saved d-OPD checkpoint to {path}")
+
+    def _save_latest(self):
+        """把完整状态覆盖写到 <output_dir>/latest（真实目录，非软链接，可续训）。"""
+        latest = self.output_dir / "latest"
+        staging = self.output_dir / ".latest_staging"
+        previous = self.output_dir / ".latest_previous"
+        if self.rank == 0:
+            shutil.rmtree(staging, ignore_errors=True)
+        dist.barrier()
+        CheckpointManager.save(
+            path=str(staging),
+            state=self._checkpoint_state(),
+            save_async=False,
+            save_only_model=self.training_args.save_only_model,
+            global_steps=self.global_step,
+        )
+        dist.barrier()
+        self._write_checkpoint_meta(staging, False)
+        dist.barrier()
+        if self.rank == 0:
+            shutil.rmtree(previous, ignore_errors=True)
+            if latest.is_symlink() or latest.exists():
+                os.replace(str(latest), str(previous))
+            os.replace(str(staging), str(latest))
+            shutil.rmtree(previous, ignore_errors=True)
+            logger.info_rank0(f"> Refreshed latest full checkpoint at {latest}")
+        dist.barrier()
+
+    def _final_checkpoint_dir(self) -> Path:
+        if self.training_args.save_steps <= 0 or self.global_step % self.training_args.save_steps:
+            name = f"global_step_{self.global_step}_final"
+        else:
+            name = f"global_step_{self.global_step}"
+        return self.output_dir / "checkpoints" / name
+
+    def _link_latest_to_final(self):
+        """训练结束后把 latest 换成指向最终全量检查点的软链接（只在终点做）。"""
+        latest = self.output_dir / "latest"
+        target = self._final_checkpoint_dir()
+        relative = os.path.relpath(str(target), start=str(self.output_dir))
+        if self.rank == 0:
+            if latest.is_symlink():
+                latest.unlink()
+            elif latest.exists():
+                shutil.rmtree(latest)
+            os.symlink(relative, str(latest))
+            logger.info_rank0(f"> Linked {latest} -> {relative}")
+        dist.barrier()
 
     def train(self):
         stop_after = self.dopd_args.stop_after_iteration or self.training_args.max_steps
@@ -1143,10 +1217,22 @@ class DOPDTrainer:
 
             if self.training_args.save_steps > 0 and self.global_step % self.training_args.save_steps == 0:
                 self._save()
+            latest_steps = self.dopd_args.save_latest_steps
+            if (
+                latest_steps
+                and self.global_step % latest_steps == 0
+                and self.global_step < stop_after
+            ):
+                self._save_latest()
             _empty_cache()
 
         if self.training_args.save_steps <= 0 or self.global_step % self.training_args.save_steps:
             self._save(final=True)
+        if self.dopd_args.save_latest_steps:
+            if self.global_step >= self.training_args.max_steps and self.dopd_args.save_latest_final_symlink:
+                self._link_latest_to_final()
+            elif self.global_step % self.dopd_args.save_latest_steps:
+                self._save_latest()
         elapsed = time.time() - start_time
         if stop_after < self.training_args.max_steps:
             logger.info_rank0(
