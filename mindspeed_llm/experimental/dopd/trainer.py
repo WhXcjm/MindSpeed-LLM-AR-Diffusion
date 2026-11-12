@@ -1024,6 +1024,13 @@ class DOPDTrainer:
             logger.info_rank0(f"> Refreshed latest full checkpoint at {latest}")
         dist.barrier()
 
+    def _latest_global_step(self) -> int:
+        meta = self.output_dir / "latest" / "dopd_checkpoint_meta.json"
+        try:
+            return int(json.loads(meta.read_text(encoding="utf-8")).get("global_step"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return -1
+
     def _final_checkpoint_dir(self) -> Path:
         if self.training_args.save_steps <= 0 or self.global_step % self.training_args.save_steps:
             name = f"global_step_{self.global_step}_final"
@@ -1231,7 +1238,8 @@ class DOPDTrainer:
         if self.dopd_args.save_latest_steps:
             if self.global_step >= self.training_args.max_steps and self.dopd_args.save_latest_final_symlink:
                 self._link_latest_to_final()
-            elif self.global_step % self.dopd_args.save_latest_steps:
+            elif self._latest_global_step() != self.global_step:
+                # stop_after_iteration 提前收尾时也把 latest 对齐到当前轮，便于从 latest 续训/导出
                 self._save_latest()
         elapsed = time.time() - start_time
         if stop_after < self.training_args.max_steps:
