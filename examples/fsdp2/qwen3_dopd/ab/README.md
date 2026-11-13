@@ -82,6 +82,14 @@ bash examples/fsdp2/qwen3_dopd/ab/run.sh paths.env eval combined50
 bash examples/fsdp2/qwen3_dopd/ab/run.sh paths.env compare
 ```
 
+新增的 `eval-group` 会从同一份 HF 权重依次跑 AR 和扩散。训练、导出和 `eval-group` 使用相同组名，可选 `baseline`、`kl_only`、`prompt_only`、`kl+prompt`、`EOS_loss_only` 或 `official`，原有 `combined` 也对应 `kl+prompt` 配置。以下命令使用固定的 200 题和 1024 token 上限，适合在同一评测协议下比较六组权重。
+
+```bash
+bash examples/fsdp2/qwen3_dopd/ab/run.sh paths.env eval-group kl_only
+```
+
+上例分别输出 `eval-groups/kl_only50-ar/` 和 `eval-groups/kl_only50-response/`。加 `--block-alignment prompt` 会只跑一次换边界的扩散评测，写入 `eval-cross`。评测 `official` 权重时，这条命令仍使用固定 200 题对照口径。六项基准、4096 token 的论文评测入口见[实验配置](../README.md#实验配置)。
+
 五组都直接读评测仓库中已抽好的 GSM8K 文件。它来自官方 test split 的 1,319 题，seed 42 无放回抽 200 题，再按原题号排序。0-shot 题面明确要求 `\boxed{}`，统一使用 Qwen3 模板的 `enable_thinking=False`，每题贪心解码，最多生成 1024 个新 token。256 准确率按同一次生成的前 256 token 评分。评分取最后一个完整的 `\boxed{…}`，用 Math-Verify 比较其数学值。
 
 - `eval/<组>/summary.json` 分别汇总 256 前缀和完整预算的准确率、EOS 结束比例、EOS 条件准确率、完整盒子率、生成长度中位数。另有旧式首个简单盒子的字符串精确匹配作对照。

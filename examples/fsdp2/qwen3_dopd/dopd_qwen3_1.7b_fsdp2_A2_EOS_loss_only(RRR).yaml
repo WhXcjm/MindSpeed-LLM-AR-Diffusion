@@ -45,7 +45,7 @@ training:
   dataloader_num_workers: 0
   dataloader_drop_last: false
   seed: 10086
-  output_dir: /mnt/pipeline-data/f50058111/model_train/opd/qwen3_1.7b_dopd_paper_1node_8card_1019/
+  output_dir: /mnt/pipeline-data/f50058111/model_train/opd/qwen3_1.7b_dopd_EOS_loss_only/
   resume_from_checkpoint: null
   optimizer: adamw
   lr: 1.0e-5
@@ -88,6 +88,9 @@ dopd:
   response_schedule_steps: 100
   prompts_per_iteration: 128
   block_size: 4
+  block_alignment: response
+  reconstruct_block_alignment: response
+  loss_mask_mode: newly_unmasked
   denoise_steps: 4
   temperature: 1.0
   top_k: 0
@@ -102,6 +105,22 @@ dopd:
   verifier: mindspeed_llm.experimental.dopd.opdlm_verifier:verify_opdlm_record
   # 前 10 个外层迭代保存每条原始回答、正确性和 verifier 失败原因。
   rollout_audit_iterations: 10
-  exclude_eos_from_loss: true
+  exclude_eos_from_loss: false
   score_chunk_size: 128
   teacher_cache_max_bytes: 17179869184
+  inference:
+    modes: [ar, diffusion]
+    block_alignment: response
+    block_sizes: "4"
+    steps_per_block: 4
+    thresholds: fixed  # low_confidence_static
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    max_new_tokens: 1024
+    seed_mode: none
+    use_chat_template: true
+    enable_thinking: false
+    ignore_eos: false
+    repeats: 1
+    paper_aligned: false

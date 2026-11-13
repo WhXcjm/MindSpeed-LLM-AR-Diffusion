@@ -2,9 +2,8 @@
 """Inspect or paper-align decoding of a d-OPD DCP model.
 
 The d-OPD trainer saves a PyTorch Distributed Checkpoint (DCP), not a standalone
-Hugging Face directory.  This entrypoint rebuilds the Qwen3 diffusion student
-with the same MindSpeed FSDP2 layout, loads the DCP weights, and runs the same
-    block-diffusion decoding state machine used by the released JetEngine.
+Hugging Face directory. This entrypoint rebuilds the Qwen3 diffusion student
+with the same MindSpeed FSDP2 layout and runs block-diffusion decoding.
 
 Only rank zero prints and writes results.  Every rank still executes every model
 forward because the checkpoint is loaded into an FSDP2 model.
@@ -17,6 +16,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 import types
 from dataclasses import asdict, dataclass, field
@@ -32,7 +32,7 @@ DEFAULT_CHECKPOINT = (
     "/share/dataset/x00840191/model_train/ckpt/qwen3_1.7b_dopd_1010/"
     "checkpoints/global_step_483_final"
 )
-DECODER_REVISION = "dopd-paper-c4-block-cache-v3"
+DECODER_REVISION = "dopd-block-alignment-v4"
 
 
 @dataclass
@@ -75,7 +75,7 @@ class DecodeStats:
         return result
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Load a MindSpeed FSDP2 d-OPD DCP checkpoint and compare block-size "
@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit dopd_config.json; normally inferred from checkpoint.",
     )
     parser.add_argument(
+        "--config-yaml",
+        type=Path,
+        help="Use dopd.inference settings from this training YAML. CLI flags take precedence.",
+    )
+    parser.add_argument(
         "--output-json",
         default=None,
         help="Result path. Defaults to <run_dir>/dopd_decode_analysis.json.",
@@ -114,6 +119,19 @@ def parse_args() -> argparse.Namespace:
         "--block-sizes",
         default="4",
         help="Comma-separated block sizes, for example 1,2,4,8,16.",
+    )
+    parser.add_argument(
+        "--block-alignment",
+        choices=("response", "prompt"),
+        default="response",
+        help="Start a new block at the response or complete the last prompt block first.",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("ar", "diffusion"),
+        default=["diffusion"],
+        help="Decoders to run on the same checkpoint and prompt.",
     )
     parser.add_argument(
         "--thresholds",
@@ -141,8 +159,8 @@ def parse_args() -> argparse.Namespace:
         choices=("ar", "none"),
         default="none",
         help=(
-            "'none' starts each response-aligned block fully masked, as in the "
-            "paper evaluation; 'ar' is the legacy hybrid decoder."
+            "'none' starts generated positions masked; 'ar' seeds the first token "
+            "of each response-aligned block with the legacy hybrid decoder."
         ),
     )
     parser.add_argument(
@@ -152,10 +170,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable-thinking",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Enable Qwen thinking when a compatible chat template is used.",
     )
-    parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
@@ -172,7 +191,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Validate the complete Appendix C.4 decoding recipe. Use "
+            "Validate the decoding settings specified in Appendix C.4. Use "
             "--no-paper-aligned only for deliberate block/threshold ablations."
         ),
     )
@@ -181,7 +200,44 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep step traces in JSON but suppress their console rendering.",
     )
-    return parser.parse_args()
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argv)
+    if args.config_yaml is not None:
+        import yaml
+
+        config = yaml.safe_load(args.config_yaml.read_text(encoding="utf-8"))
+        settings = _nested(config, "dopd", "inference")
+    else:
+        config, _ = load_run_config(args)
+        settings = _nested(config, "dopd", "inference", default={})
+    if not isinstance(settings, dict):
+        parser.error("dopd.inference must be a mapping")
+
+    decoder_options = {
+        "block_sizes", "block_alignment", "thresholds", "steps_per_block",
+        "max_new_tokens", "temperature", "top_k", "top_p", "seed", "seed_mode",
+        "use_chat_template", "enable_thinking", "ignore_eos", "warmup", "repeats",
+        "paper_aligned", "modes",
+    }
+    boolean_options = {"use_chat_template", "enable_thinking", "ignore_eos", "paper_aligned"}
+    config_args = []
+    for name, value in settings.items():
+        if name not in decoder_options:
+            parser.error(f"unknown dopd.inference setting: {name}")
+        option = name.replace("_", "-")
+        if name in boolean_options:
+            if not isinstance(value, bool):
+                parser.error(f"dopd.inference.{name} must be a boolean")
+            config_args.append(f"--{option}" if value else f"--no-{option}")
+        elif name == "modes":
+            if not isinstance(value, list) or not value or any(
+                mode not in ("ar", "diffusion") for mode in value
+            ):
+                parser.error("dopd.inference.modes must list ar, diffusion, or both")
+            config_args.extend(["--modes", *value])
+        else:
+            config_args.append(f"--{option}={value}")
+    return parser.parse_args(config_args + argv)
 
 
 def _nested(mapping: dict[str, Any], *keys: str, default=None):
@@ -247,15 +303,16 @@ def validate_paper_alignment(
     thresholds: list[Optional[float]],
     run_config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Fail closed when a run labelled paper-aligned changes decoding semantics."""
+    """Validate the documented Appendix C.4 settings and record the block boundary."""
     trained_block_size = int(_nested(run_config, "dopd", "block_size", default=4))
+    opdlm_block_alignment = "prompt"
     expected = {
         "trained_block_size": trained_block_size,
         "block_sizes": [4],
         "steps_per_block": 4,
         "remasking": "low_confidence_static",
         "thresholds": [None],
-        "response_aligned_blocks": True,
+        "opdlm_block_alignment": opdlm_block_alignment,
         "temperature": 1.0,
         "top_k": 1,
         "top_p": 1.0,
@@ -289,12 +346,16 @@ def validate_paper_alignment(
         raise ValueError(
             "--paper-aligned configuration mismatch:\n- " + "\n- ".join(mismatches)
         )
+    matches_opdlm_block_alignment = args.block_alignment == opdlm_block_alignment
     return {
         "enabled": args.paper_aligned,
-        "status": "aligned" if not mismatches else "diagnostic_override",
+        "status": (
+            "aligned" if not mismatches and matches_opdlm_block_alignment else "diagnostic_override"
+        ),
         "expected": expected,
         "mismatches": mismatches,
         "paper_section": "Appendix C.4 Benchmark evaluation",
+        "matches_opdlm_block_alignment": matches_opdlm_block_alignment,
     }
 
 
@@ -562,8 +623,9 @@ def generate_causal_greedy(
     max_new_tokens: int,
     mask_token_id: int,
     eos_token_id: Optional[int],
+    sync_ranks: bool = False,
 ) -> torch.LongTensor:
-    """Small AR probe used only to diagnose base/checkpoint integrity."""
+    """Generate autoregressively with greedy token selection."""
     from transformers.cache_utils import DynamicCache
     from mindspeed_llm.fsdp2.models.qwen3.utils import set_diffusion_lm
 
@@ -590,11 +652,19 @@ def generate_causal_greedy(
     logits[:, mask_token_id] = -torch.inf
     next_token = logits.argmax(dim=-1, keepdim=True)
     generated: list[torch.LongTensor] = []
+    finished = torch.zeros((), dtype=torch.int32, device=prompt_ids.device)
 
     for offset in range(max_new_tokens):
-        generated.append(next_token)
-        if eos_token_id is not None and next_token.eq(int(eos_token_id)).all().item():
-            break
+        if not finished.item():
+            generated.append(next_token)
+            if eos_token_id is not None:
+                finished.copy_(next_token.eq(int(eos_token_id)).all())
+        if eos_token_id is not None:
+            all_finished = finished.clone()
+            if sync_ranks:
+                dist.all_reduce(all_finished, op=dist.ReduceOp.MIN)
+            if all_finished.item():
+                break
         if offset + 1 == max_new_tokens:
             break
         absolute_position = prompt_length + offset
@@ -694,80 +764,90 @@ def generate_with_trace(
     eos_token_id: Optional[int],
     ignore_eos: bool,
     collect_trace: bool,
+    block_alignment: str = "response",
 ) -> tuple[torch.LongTensor, DecodeStats, list[dict[str, Any]]]:
     from transformers.cache_utils import DynamicCache
+    from mindspeed_llm.experimental.dopd.core import prompt_tail_length
     from mindspeed_llm.fsdp2.models.qwen3.utils import set_diffusion_lm
 
-    if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
-        raise ValueError("Decode analysis currently expects one prompt with batch size 1.")
+    if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.shape[1] == 0:
+        raise ValueError("Decode analysis expects one nonempty prompt with batch size 1.")
     if max_new_tokens <= 0 or block_size <= 0 or steps_per_block <= 0:
         raise ValueError("Generation length, block size, and denoising steps must be positive.")
+    if seed_mode == "ar" and block_alignment != "response":
+        raise ValueError("AR seeding requires response block alignment.")
 
     device = prompt_ids.device
     generator = torch.Generator(device=device).manual_seed(seed)
     prompt_length = prompt_ids.shape[1]
+    prompt_tail = prompt_tail_length(prompt_length, block_size, block_alignment)
+    prefill_length = prompt_length - prompt_tail
     stats = DecodeStats(prompt_tokens=prompt_length)
     traces: list[dict[str, Any]] = []
     cache = DynamicCache()
 
-    # JetEngine PREFILL is staircase/block-causal, not ordinary AR-causal:
-    # prompt blocks are causal across blocks and bidirectional within a block.
+    # JetEngine prefills complete prompt blocks in prompt-aligned mode.
     set_diffusion_lm(model, True)
-    prompt_positions = torch.arange(prompt_length, device=device)
     model_dtype = next(model.parameters()).dtype
-    prefill = _root_forward(
-        model,
-        lm_positions=torch.tensor([prompt_length - 1], device=device),
-        input_ids=prompt_ids,
-        attention_mask=_block_causal_prefix_mask(
-            prompt_length,
-            block_size,
-            dtype=model_dtype,
-            device=device,
-        ),
-        position_ids=prompt_positions.unsqueeze(0),
-        cache_position=prompt_positions,
-        past_key_values=cache,
-        use_cache=True,
-    )
-    cache = prefill.past_key_values
-    stats.prefill_nfe = 1
     next_token = None
-    if seed_mode == "ar":
-        next_token, _ = _sample(
-            prefill.logits[:, -1, :],
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            mask_token_id=mask_token_id,
-            generator=generator,
+    if prefill_length:
+        prompt_positions = torch.arange(prefill_length, device=device)
+        prefill = _root_forward(
+            model,
+            lm_positions=prompt_positions[-1:],
+            input_ids=prompt_ids[:, :prefill_length],
+            attention_mask=_block_causal_prefix_mask(
+                prefill_length,
+                block_size,
+                dtype=model_dtype,
+                device=device,
+            ),
+            position_ids=prompt_positions.unsqueeze(0),
+            cache_position=prompt_positions,
+            past_key_values=cache,
+            use_cache=True,
         )
-        next_token = next_token.unsqueeze(1)
-    del prefill
+        cache = prefill.past_key_values
+        stats.prefill_nfe = 1
+        if seed_mode == "ar":
+            next_token, _ = _sample(
+                prefill.logits[:, -1, :],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                mask_token_id=mask_token_id,
+                generator=generator,
+            )
+            next_token = next_token.unsqueeze(1)
+        del prefill
 
     response_blocks: list[torch.LongTensor] = []
     generated = 0
-    num_blocks = math.ceil(max_new_tokens / block_size)
-    stop_after_block = False
+    num_blocks = math.ceil((max_new_tokens + prompt_tail) / block_size)
 
     for block_index in range(num_blocks):
-        current_length = min(block_size, max_new_tokens - generated)
-        block_start = prompt_length + generated
+        fixed_length = prompt_tail if block_index == 0 else 0
+        new_tokens = min(block_size - fixed_length, max_new_tokens - generated)
+        current_length = block_size if block_alignment == "prompt" else new_tokens
+        block_start = prompt_length + generated - fixed_length
         block = torch.full(
             (1, current_length),
             mask_token_id,
             dtype=prompt_ids.dtype,
             device=device,
         )
+        if fixed_length:
+            block[:, :fixed_length] = prompt_ids[:, prefill_length:]
         seeded_positions: list[int] = []
         if seed_mode == "ar" and next_token is not None:
             block[:, 0] = next_token[:, 0]
             seeded_positions = [generated]
 
-        initial_masks = int(block.eq(mask_token_id).sum().item())
-        block_steps = min(steps_per_block, initial_masks) if initial_masks else 0
+        initial_masks = int(block[:, fixed_length:].eq(mask_token_id).sum().item())
+        schedule_width = current_length if block_alignment == "prompt" else initial_masks
+        block_steps = min(steps_per_block, schedule_width)
         schedule = (
-            _transfer_schedule(initial_masks, block_steps) if block_steps else []
+            _transfer_schedule(schedule_width, block_steps) if block_steps else []
         )
         reveal_steps: list[Optional[int]] = []
         block_trace: dict[str, Any] = {}
@@ -778,7 +858,9 @@ def generate_with_trace(
             ]
             block_trace = {
                 "block_index": block_index,
-                "response_positions": [generated, generated + current_length],
+                "response_positions": [generated, generated + current_length - fixed_length],
+                "prompt_tail_tokens": fixed_length,
+                "tokens_past_response_budget": current_length - fixed_length - new_tokens,
                 "seed_mode": seed_mode,
                 "seeded_response_positions": seeded_positions,
                 "initial_mask_count": initial_masks,
@@ -790,6 +872,7 @@ def generate_with_trace(
 
         for step_index in range(block_steps):
             masked = block.eq(mask_token_id)
+            masked[:, :fixed_length] = False
             if not masked.any().item():
                 break
             remaining_before = int(masked.sum().item())
@@ -882,7 +965,7 @@ def generate_with_trace(
                         "committed_count": committed,
                         "remaining_after": remaining_after,
                         "committed_response_positions": [
-                            generated + index for index in committed_indices_list
+                            generated + index - fixed_length for index in committed_indices_list
                         ],
                         "committed_token_ids": committed_ids.tolist(),
                         "committed_token_text": [
@@ -904,10 +987,11 @@ def generate_with_trace(
                     }
                 )
 
-        if block.eq(mask_token_id).any().item():
+        if block[:, fixed_length:].eq(mask_token_id).any().item():
             raise RuntimeError(f"Block {block_index} did not fully denoise.")
-        response_blocks.append(block)
-        generated += current_length
+        response_block = block[:, fixed_length : fixed_length + new_tokens]
+        response_blocks.append(response_block)
+        generated += new_tokens
         stats.completed_blocks += 1
 
         if collect_trace:
@@ -967,9 +1051,10 @@ def generate_with_trace(
             next_token = next_token.unsqueeze(1)
         del refresh
 
-        if not ignore_eos and eos_token_id is not None:
-            stop_after_block = bool(block.eq(int(eos_token_id)).any().item())
-        if stop_after_block or block_index + 1 == num_blocks:
+        if (
+            not ignore_eos and eos_token_id is not None
+            and response_block.eq(int(eos_token_id)).any().item()
+        ):
             break
 
     response = torch.cat(response_blocks, dim=1)
@@ -1070,12 +1155,15 @@ def main() -> int:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
     if args.diagnostic_ar_tokens < 0:
         raise ValueError("--diagnostic-ar-tokens must be non-negative.")
+    if "diffusion" in args.modes and args.seed_mode == "ar" and args.block_alignment != "response":
+        raise ValueError("AR seeding requires response block alignment.")
 
-    block_sizes = parse_block_sizes(args.block_sizes)
-    thresholds = parse_thresholds(args.thresholds)
+    block_sizes = parse_block_sizes(args.block_sizes) if "diffusion" in args.modes else []
+    thresholds = parse_thresholds(args.thresholds) if block_sizes else []
     run_config, run_config_path = load_run_config(args)
-    paper_alignment = validate_paper_alignment(
-        args, block_sizes, thresholds, run_config
+    paper_alignment = (
+        validate_paper_alignment(args, block_sizes, thresholds, run_config)
+        if block_sizes else None
     )
     checkpoint, model_path, mask_token_id = resolve_paths_and_ids(args, run_config)
     model, tokenizer, device, base_causal_sanity = initialize_and_load_model(
@@ -1114,20 +1202,45 @@ def main() -> int:
     prompt = prompt_values[0]
     prompt_ids = tokenize_prompt(tokenizer, prompt, args).to(device)
     max_positions = getattr(model.config, "max_position_embeddings", None)
-    if max_positions is not None and prompt_ids.shape[1] + args.max_new_tokens > int(
-        max_positions
-    ):
+    context_length = prompt_ids.shape[1] + args.max_new_tokens
+    if block_sizes and args.block_alignment == "prompt":
+        context_length = max(math.ceil(context_length / size) * size for size in block_sizes)
+    if max_positions is not None and context_length > int(max_positions):
         raise ValueError(
-            f"Prompt ({prompt_ids.shape[1]}) + generation ({args.max_new_tokens}) "
-            f"exceeds max_position_embeddings={max_positions}."
+            f"Decoding requires {context_length} positions, "
+            f"exceeding max_position_embeddings={max_positions}."
         )
 
     output_json = Path(args.output_json) if args.output_json else _run_dir(checkpoint) / "dopd_decode_analysis.json"
+    ar_result = None
+    if "ar" in args.modes:
+        ar_response = generate_causal_greedy(
+            model,
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            mask_token_id=mask_token_id,
+            eos_token_id=None if args.ignore_eos else tokenizer.eos_token_id,
+            sync_ranks=world_size > 1,
+        )
+        if rank == 0:
+            ar_ids = ar_response[0].tolist()
+            ar_result = {
+                "mode": "ar",
+                "block_alignment": None,
+                "generated_token_ids": ar_ids,
+                "generated_text": tokenizer.decode(
+                    ar_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                ),
+                "repetition": token_repetition_diagnostics(ar_ids),
+            }
+            print(f"\nAR output ({len(ar_ids)} tokens):\n{ar_result['generated_text']}", flush=True)
+
     results: list[dict[str, Any]] = []
     generation_common = {
         "model": model,
         "tokenizer": tokenizer,
         "prompt_ids": prompt_ids,
+        "block_alignment": args.block_alignment,
         "max_new_tokens": args.max_new_tokens,
         "mask_token_id": mask_token_id,
         "temperature": args.temperature,
@@ -1230,10 +1343,14 @@ def main() -> int:
             "checkpoint": str(checkpoint),
             "base_model_path": str(model_path),
             "dopd_config_json": str(run_config_path) if run_config_path else None,
+            "decoder_config_yaml": str(args.config_yaml) if args.config_yaml else None,
             "world_size": world_size,
             "prompt": prompt,
             "prompt_token_ids": prompt_ids[0].tolist(),
             "prompt_tokens": prompt_ids.shape[1],
+            "modes": args.modes,
+            "block_alignment": args.block_alignment if block_sizes else None,
+            "ar_result": ar_result,
             "use_chat_template": args.use_chat_template,
             "enable_thinking": args.enable_thinking,
             "max_new_tokens": args.max_new_tokens,

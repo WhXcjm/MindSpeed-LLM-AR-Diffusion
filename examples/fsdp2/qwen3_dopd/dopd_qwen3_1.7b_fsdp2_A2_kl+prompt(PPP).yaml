@@ -1,0 +1,126 @@
+model:
+  # 官方 a2d-init 保留 Qwen3-1.7B 的全部权重（包括 lm_head），仅把模型
+  # 配置声明为 a2d-qwen3；model_id=qwen3_diffusion 加载 MindSpeed 扩散注意力。
+  model_name_or_path: /mnt/pipeline-data/f50058111/model_weights/Qwen3-1.7B-a2d-init
+  model_id: qwen3_diffusion
+  trust_remote_code: false
+  train_from_scratch: false
+  init_model_with_meta_device: false
+
+data:
+  # 下方 dopd.train_data_path 会直接读取官方 JSON 数据。
+  # 本配置不会读取 Nemotron/Megatron CPT 数据。
+  dataset: null
+  template: null
+  cutoff_len: 6000
+  enable_thinking: false
+  data_manager_type: mg
+  data_shared_file_system: true
+
+parallel:
+  # 单机 8 张 A2；8 个 rank 对应论文中的全局优化器 batch 8。
+  fsdp_size: 8
+  fsdp_modules:
+    - model.layers.{*}
+    - model.embed_tokens
+    - lm_head
+  tp_size: 1
+  ep_size: 1
+  ep_modules:
+    - model.layers.{*}.mlp.experts
+  ep_fsdp_size: 1
+  ep_fsdp_modules:
+    - model.layers.{*}.mlp.experts
+  ep_dispatcher: eager
+  recompute: true
+  recompute_modules:
+    - model.layers.{*}
+  param_dtype: bf16
+  reduce_dtype: bf16
+
+training:
+  stage: pt
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  dataloader_num_workers: 0
+  dataloader_drop_last: false
+  seed: 10086
+  output_dir: /mnt/pipeline-data/f50058111/model_train/opd/qwen3_1.7b_dopd_kl+prompt/
+  resume_from_checkpoint: null
+  optimizer: adamw
+  lr: 1.0e-5
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  lr_scheduler_type: cosine
+  # 5 次外层迭代等于 7,728 个内部优化器步骤中的前 80 步。
+  warmup_ratio: 0.0103519669
+  min_lr: 1.0e-6
+  num_train_epochs: 1.0
+  max_steps: 483
+  # 保留论文评测使用的 50/100/.../450，以及最终 483 checkpoint。
+  save_steps: 50
+  save_total_limit: 10
+  save_only_model: false
+  save_async: false
+  logging_steps: 1
+  calculate_per_token_loss: false
+
+optimization:
+  use_fused_rmsnorm: false
+  use_fused_rotary_pos_emb: false
+  chunk_loss_size: 0
+
+dopd:
+  # 教师是普通自回归 Qwen3-1.7B，与 a2d-init 学生严格分开加载。
+  teacher_model_name_or_path: /mnt/pipeline-data/f50058111/model_weights/Qwen3-1.7B
+  student_checkpoint: null
+  train_data_path: /mnt/pipeline-data/f50058111/dataset/opdlm_train_data/opdlm_train.json
+  expected_train_records: 61816
+  strict_paper_alignment: true
+  active_ranks_per_optimizer_step: 8
+  mask_token_id: 151669
+  prompt_tokens: 2000
+  min_response_tokens: 100
+  max_response_tokens: 4000
+  response_schedule_steps: 100
+  prompts_per_iteration: 128
+  block_size: 4
+  block_alignment: prompt
+  reconstruct_block_alignment: prompt
+  loss_mask_mode: remaining_mask
+  denoise_steps: 4
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
+  remasking_strategy: low_confidence_dynamic
+  dynamic_threshold: 0.9
+  correction_strength: 0.5
+  candidate_top_k: 16
+  loss_top_k: 16
+  require_visible_future: true
+  correctness_gate: true
+  verifier: mindspeed_llm.experimental.dopd.opdlm_verifier:verify_opdlm_record
+  # 前 10 个外层迭代保存每条原始回答、正确性和 verifier 失败原因。
+  rollout_audit_iterations: 10
+  exclude_eos_from_loss: true
+  score_chunk_size: 128
+  teacher_cache_max_bytes: 17179869184
+  inference:
+    modes: [ar, diffusion]
+    block_alignment: prompt
+    block_sizes: "4"
+    steps_per_block: 4
+    thresholds: fixed  # low_confidence_static
+    temperature: 0.0
+    top_k: 1
+    top_p: 1.0
+    max_new_tokens: 1024
+    seed_mode: none
+    use_chat_template: true
+    enable_thinking: false
+    ignore_eos: false
+    repeats: 1
+    paper_aligned: false

@@ -15,12 +15,13 @@ Usage: bash run.sh PATHS.env COMMAND [ARGS]
 
 Training container:
   prepare
-  train baseline|combined
-  export baseline|combined
-  resume baseline|combined [iteration (default 50)]
+  train baseline|combined|kl_only|prompt_only|kl+prompt|EOS_loss_only|official
+  export GROUP
+  resume GROUP [iteration (default 50)]
 
 Evaluation container:
   eval original-ar|init-ar|init-diffusion|baseline50|combined50 [--limit N] [--block-alignment response|prompt]
+  eval-group GROUP [--limit N] [--block-alignment response|prompt]
   compare
 EOF
 }
@@ -46,18 +47,43 @@ export PYTHONUNBUFFERED=1
 
 train_group() {
     group=$1
+    local profile settings
     case "$group" in
-        baseline) loss_mode=newly_unmasked; alignment=response ;;
-        combined) loss_mode=remaining_mask; alignment=prompt ;;
-        *) fail "Expected training group baseline or combined." ;;
+        baseline) profile='baseline(RRR)' ;;
+        kl_only) profile='kl_only(RRR)' ;;
+        prompt_only) profile='prompt_only(PPP)' ;;
+        combined|kl+prompt) profile='kl+prompt(PPP)' ;;
+        EOS_loss_only) profile='EOS_loss_only(RRR)' ;;
+        official) profile='official(PRP)' ;;
+        *) fail "Unknown training group: $group" ;;
     esac
+    train_config="examples/fsdp2/qwen3_dopd/dopd_qwen3_1.7b_fsdp2_A2_${profile}.yaml"
+    settings=$(python - "$TRAIN_REPO/$train_config" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    dopd = yaml.safe_load(stream)["dopd"]
+rollout = dopd["block_alignment"]
+print(
+    dopd["loss_mask_mode"],
+    rollout,
+    dopd.get("reconstruct_block_alignment") or rollout,
+    str(dopd["exclude_eos_from_loss"]).lower(),
+    dopd["inference"]["block_alignment"],
+)
+PY
+    ) || fail "Cannot read experiment settings: $train_config"
+    read -r loss_mode alignment reconstruct_alignment exclude_eos eval_alignment <<< "$settings"
     train_dir="$RUN_ROOT/train/$group"
     ckpt50="$train_dir/checkpoints/global_step_50"
 }
 
 inspect_checkpoint() {
     python "$AB_DIR/assets.py" checkpoint-info "$1" --iteration "$2" \
-        --loss-mask-mode "$loss_mode" --block-alignment "$alignment"
+        --loss-mask-mode "$loss_mode" --block-alignment "$alignment" \
+        --reconstruct-block-alignment "$reconstruct_alignment" --exclude-eos-from-loss "$exclude_eos"
 }
 
 run_training() {
@@ -91,16 +117,25 @@ run_training() {
     export PYTHONPATH="${PYTHONPATH:-}"
     source examples/fsdp2/env_config.sh
     python -m torch.distributed.run --standalone --nproc_per_node=8 \
-        train_dopd_fsdp2.py examples/fsdp2/qwen3_dopd/dopd_qwen3_1.7b_fsdp2_A2.yaml \
+        train_dopd_fsdp2.py "$train_config" \
         "--model.model_name_or_path=$MODELS/a2d-init" \
         "--dopd.teacher_model_name_or_path=$QWEN3_MODEL" \
         "--dopd.train_data_path=$OPDLM_TRAIN_DATA" \
         "--training.output_dir=$train_dir" \
-        "--dopd.loss_mask_mode=$loss_mode" "--dopd.block_alignment=$alignment" \
         "${stopping[@]}" 2>&1 | tee "$log"
     if [[ "$action" == train ]]; then
         inspect_checkpoint "$ckpt50" 50
     fi
+}
+
+run_evaluation() {
+    local mode=$1 name=$2 log
+    mkdir -p -- "$RUN_ROOT/eval-logs"
+    log=$(mktemp "$RUN_ROOT/eval-logs/$name.XXXXXX")
+    python -m torch.distributed.run --standalone --nproc_per_node="$EVAL_NPUS" \
+        scripts/dopd50_eval.py --model "$model" --tokenizer "$QWEN3_MODEL" --mode "$mode" --device npu \
+        --block-alignment "$alignment" --output-dir "$output_root/$name" \
+        "${extra[@]}" 2>&1 | tee "$log"
 }
 
 case "$COMMAND" in
@@ -133,20 +168,27 @@ case "$COMMAND" in
         mv -T -- "$stage" "$destination"
         printf 'Exported %s\n' "$destination"
         ;;
-    eval)
+    eval|eval-group)
         [[ $# -ge 1 ]] || fail "Provide an evaluation group."
         group=$1
         shift
         mode=diffusion
         alignment=response
-        case "$group" in
-            original-ar) model=$QWEN3_MODEL; mode=ar ;;
-            init-ar) model="$MODELS/a2d-init-hf"; mode=ar ;;
-            init-diffusion) model="$MODELS/a2d-init-hf" ;;
-            baseline50) model="$RUN_ROOT/exports/baseline50" ;;
-            combined50) model="$RUN_ROOT/exports/combined50"; alignment=prompt ;;
-            *) fail "Unknown evaluation group: $group" ;;
-        esac
+        if [[ "$COMMAND" == eval-group ]]; then
+            train_group "$group"
+            model="$RUN_ROOT/exports/${group}50"
+            group="${group}50"
+            alignment=$eval_alignment
+        else
+            case "$group" in
+                original-ar) model=$QWEN3_MODEL; mode=ar ;;
+                init-ar) model="$MODELS/a2d-init-hf"; mode=ar ;;
+                init-diffusion) model="$MODELS/a2d-init-hf" ;;
+                baseline50) model="$RUN_ROOT/exports/baseline50" ;;
+                combined50) model="$RUN_ROOT/exports/combined50"; alignment=prompt ;;
+                *) fail "Unknown evaluation group: $group" ;;
+            esac
+        fi
         override=
         limit=
         while [[ $# -gt 0 ]]; do
@@ -167,8 +209,9 @@ case "$COMMAND" in
         extra=()
         if [[ -n "$override" ]]; then
             output_root="$RUN_ROOT/eval-cross"
-            group="$group-$override"
             alignment=$override
+        elif [[ "$COMMAND" == eval-group ]]; then
+            output_root="$RUN_ROOT/eval-groups"
         fi
         if [[ -n "$limit" ]]; then
             output_root="$output_root-smoke-$limit"
@@ -180,12 +223,14 @@ case "$COMMAND" in
         cd -- "$EVAL_REPO"
         export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
         export TOKENIZERS_PARALLELISM=false
-        mkdir -p -- "$RUN_ROOT/eval-logs"
-        log=$(mktemp "$RUN_ROOT/eval-logs/$group.XXXXXX")
-        python -m torch.distributed.run --standalone --nproc_per_node="$EVAL_NPUS" \
-            scripts/dopd50_eval.py --model "$model" --tokenizer "$QWEN3_MODEL" --mode "$mode" --device npu \
-            --block-alignment "$alignment" --output-dir "$output_root/$group" \
-            "${extra[@]}" 2>&1 | tee "$log"
+        if [[ "$COMMAND" == eval-group ]]; then
+            if [[ -z "$override" ]]; then
+                run_evaluation ar "$group-ar"
+            fi
+            run_evaluation diffusion "$group-$alignment"
+        else
+            run_evaluation "$mode" "${group}${override:+-$override}"
+        fi
         ;;
     compare)
         [[ $# -eq 0 ]] || fail "compare takes no arguments."

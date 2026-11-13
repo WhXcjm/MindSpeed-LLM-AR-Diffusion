@@ -1,9 +1,12 @@
 import random
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from examples.fsdp2.qwen3_dopd import inference_dopd_decode_analysis as decode_analysis
 from mindspeed_llm.experimental.dopd import rollout, scoring
+from mindspeed_llm.experimental.dopd.config import DOPDArguments
 from mindspeed_llm.experimental.dopd.core import (
     active_rank_training_schedule,
     apply_future_reweighting,
@@ -16,6 +19,26 @@ from mindspeed_llm.experimental.dopd.core import (
     topk_forward_kl,
 )
 from mindspeed_llm.experimental.dopd.rollout import _prompt_block_attention_mask
+
+
+@pytest.mark.parametrize(
+    "rollout_alignment,reconstruct_alignment,expected",
+    [
+        ("response", None, "response"),
+        ("prompt", None, "prompt"),
+        ("prompt", "response", "response"),
+        ("response", "prompt", "prompt"),
+    ],
+)
+def test_reconstruction_alignment_inherits_or_overrides_rollout(
+    rollout_alignment, reconstruct_alignment, expected
+):
+    args = DOPDArguments(
+        block_alignment=rollout_alignment,
+        reconstruct_block_alignment=reconstruct_alignment,
+    )
+    assert args.block_alignment == rollout_alignment
+    assert args.resolved_reconstruct_block_alignment == expected
 
 
 def test_two_node_rotation_retains_global_optimizer_batch_eight():
@@ -229,7 +252,16 @@ def test_prompt_tail_eos_does_not_stop_generation(monkeypatch):
     assert model.calls[1][1][0, 0, :, 0].lt(0).all()
 
 
-def test_prompt_aligned_loss_projects_response_and_scores_same_block(monkeypatch):
+@pytest.mark.parametrize(
+    "reconstruct_alignment,expected_noised,expected_future",
+    [
+        ("prompt", [99, 22, 99, 24, 25], [(6, 8), (8, 11)]),
+        ("response", [21, 22, 99, 24, 99], [(8, 10)]),
+    ],
+)
+def test_loss_projects_response_and_scores_within_reconstruction_block(
+    monkeypatch, reconstruct_alignment, expected_noised, expected_future
+):
     monkeypatch.setattr(scoring, "set_diffusion_lm", lambda model, value: None)
     student = _RolloutProbe()
     student.mask_token_id = 99
@@ -257,24 +289,78 @@ def test_prompt_aligned_loss_projects_response_and_scores_same_block(monkeypatch
         return torch.arange(branch_token_ids.numel(), dtype=torch.float32)
 
     monkeypatch.setattr(scoring, "score_future_branches", score)
+    response = torch.tensor([[21, 22, 23, 24, 25]])
+    state = sample_intermediate_state(
+        response[0], torch.tensor([2, 1, 4, 3, 3]), 4, 99,
+        SimpleNamespace(choice=lambda choices: choices[-1]),
+        prompt_length=6,
+        block_alignment=reconstruct_alignment,
+        loss_mask_mode="remaining_mask",
+    )
+    # The same reveal times give different state and scoring boundaries.
+    noised_position_start = 4 if reconstruct_alignment == "prompt" else 6
+    expected_tail = [35, 36] if reconstruct_alignment == "prompt" else []
+    assert state.noised_response.tolist() == expected_noised
     loss, stats = scoring.compute_dopd_loss(
         student, teacher, torch.tensor([[31, 32, 33, 34, 35, 36]]),
-        torch.tensor([[21, 22, 23, 24, 25]]),
-        torch.tensor([[99, 22, 99, 24, 25]]),
-        torch.tensor([[True, False, True, False, False]]),
+        response, state.noised_response.unsqueeze(0), state.loss_mask.unsqueeze(0),
         block_size=4, candidate_top_k=2, loss_top_k=2, correction_strength=0.5,
         require_visible_future=True, correction_allowed=True,
         score_chunk_size=8, cache_max_bytes=1024,
-        block_alignment="prompt",
+        block_alignment=reconstruct_alignment,
     )
-    assert scored == [(6, 8), (8, 11)]
-    assert stats.loss_tokens == stats.eligible_positions == 2
+    assert scored == expected_future
+    assert stats.loss_tokens == 2
+    assert stats.eligible_positions == len(expected_future)
     ids, mask, positions = student.calls[0]
-    assert ids[0, 11:].tolist() == [35, 36, 99, 22, 99, 24, 25]
-    assert positions.tolist() == [list(range(11)) + list(range(4, 11))]
-    assert mask[0, 0, 13, 4:11].lt(0).all()
+    assert ids[0, 11:].tolist() == expected_tail + expected_noised
+    assert positions.tolist() == [list(range(11)) + list(range(noised_position_start, 11))]
+    assert mask[0, 0, 11, noised_position_start:11].lt(0).all()
     loss.backward()
     assert student.lm_head.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    "alignment,prompt,first_block,past_budget",
+    [
+        ("response", [31, 32, 33, 34, 35, 36], [99, 99, 99], 0),
+        ("prompt", [31, 32, 33, 34, 35, 36], [35, 36, 99, 99], 3),
+        ("prompt", [31, 32, 15], [31, 32, 15, 99], 2),
+    ],
+)
+def test_dcp_decode_alignment_preserves_prompt_and_response_budget(
+    alignment, prompt, first_block, past_budget
+):
+    student = _RolloutProbe()
+    student.model = SimpleNamespace(layers=[])
+    tokenizer = SimpleNamespace(decode=lambda ids, **kwargs: str(list(ids)))
+    response, stats, trace = decode_analysis.generate_with_trace(
+        student, tokenizer, torch.tensor([prompt]), max_new_tokens=3,
+        block_size=4, steps_per_block=4, threshold=None, mask_token_id=99,
+        temperature=1.0, top_k=1, top_p=1.0, seed=42, seed_mode="none",
+        eos_token_id=len(prompt) + 13, ignore_eos=False, collect_trace=True,
+        block_alignment=alignment,
+    )
+    expected_prefill = len(prompt) if alignment == "response" else len(prompt) // 4 * 4
+    if expected_prefill:
+        assert student.calls[0][0].tolist() == [prompt[:expected_prefill]]
+    assert student.calls[stats.prefill_nfe][0].tolist() == [first_block]
+    assert stats.prefill_nfe == int(expected_prefill > 0)
+    assert response.tolist() == [list(range(len(prompt) + 10, len(prompt) + 13))]
+    assert stats.generated_tokens == 3
+    assert trace[-1]["tokens_past_response_budget"] == past_budget
+
+
+def test_dcp_decode_does_not_treat_prompt_eos_as_response_eos():
+    student = _RolloutProbe()
+    student.model = SimpleNamespace(layers=[])
+    response, _, _ = decode_analysis.generate_with_trace(
+        student, None, torch.tensor([[31, 32, 15]]), max_new_tokens=3,
+        block_size=4, steps_per_block=4, threshold=None, mask_token_id=99,
+        temperature=1.0, top_k=1, top_p=1.0, seed=42, seed_mode="none",
+        eos_token_id=15, ignore_eos=False, collect_trace=False, block_alignment="prompt",
+    )
+    assert response.tolist() == [[13, 14, 15]]
 
 
 def test_future_reweighting_normalizes_and_topk_kl_backpropagates():

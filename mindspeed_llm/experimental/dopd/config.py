@@ -31,7 +31,7 @@ class DOPDArguments:
     )
     strict_paper_alignment: bool = field(
         default=False,
-        metadata={"help": "启动时校验公开 d-OPD 论文及原仓库中的超参数。"},
+        metadata={"help": "启动时校验 d-OPD 的共用训练超参数。"},
     )
     active_ranks_per_optimizer_step: int = field(
         default=0,
@@ -69,7 +69,12 @@ class DOPDArguments:
     block_size: int = field(default=4, metadata={"help": "Student block length."})
     block_alignment: str = field(
         default="response",
-        metadata={"help": "response starts a new block; prompt carries its tail into the first block."},
+        metadata={
+            "help": (
+                "Rollout block alignment: response starts a new block; "
+                "prompt carries its tail into the first block."
+            )
+        },
     )
     loss_mask_mode: str = field(
         default="newly_unmasked",
@@ -136,6 +141,25 @@ class DOPDArguments:
         default=17179869184,
         metadata={"help": "Upper bound used to shrink candidate branch batches (16 GiB by default)."},
     )
+    reconstruct_block_alignment: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Training-state block alignment: response or prompt. "
+                "Defaults to rollout block_alignment."
+            )
+        },
+    )
+    inference: dict = field(
+        default_factory=dict,
+        metadata={"help": "Decoder settings recorded for DCP inference."},
+    )
+
+    @property
+    def resolved_reconstruct_block_alignment(self) -> str:
+        if self.reconstruct_block_alignment is None:
+            return self.block_alignment
+        return self.reconstruct_block_alignment
 
     def __post_init__(self):
         positive = (
@@ -160,6 +184,8 @@ class DOPDArguments:
             raise ValueError("dopd.block_size must be at least 2 for future-aware correction")
         if self.block_alignment not in {"response", "prompt"}:
             raise ValueError("dopd.block_alignment must be response or prompt")
+        if self.reconstruct_block_alignment not in (None, "response", "prompt"):
+            raise ValueError("dopd.reconstruct_block_alignment must be response, prompt, or null")
         if self.loss_mask_mode not in {"newly_unmasked", "remaining_mask"}:
             raise ValueError("dopd.loss_mask_mode must be newly_unmasked or remaining_mask")
         if self.stop_after_iteration is not None and (

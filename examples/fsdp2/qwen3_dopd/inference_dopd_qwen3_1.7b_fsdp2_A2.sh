@@ -1,8 +1,9 @@
 #!/bin/bash
-# Reproduce the d-OPD paper's Appendix C.4 decoder on one 8-card A2 node.
+# Inspect d-OPD decoding on one 8-card A2 node.
 #
 # For deliberate decoder ablations, set PAPER_ALIGNED=0 before overriding
 # block sizes, thresholds, generation length, or sampling parameters.
+# The paper configuration also records OPDLM's prompt-aligned block boundary.
 #
 # If dopd_config.json records an old Base-model path, set MODEL_PATH explicitly.
 
@@ -73,47 +74,61 @@ ARGS=(
   --checkpoint "${CHECKPOINT_PATH}"
   --output-json "${OUTPUT_JSON}"
   --prompt "${PROMPT}"
-  --block-sizes "${BLOCK_SIZES}"
-  --thresholds "${THRESHOLDS}"
-  --steps-per-block "${STEPS_PER_BLOCK}"
-  --max-new-tokens "${MAX_NEW_TOKENS}"
   --mask-token-id "${MASK_TOKEN_ID}"
-  --seed-mode "${SEED_MODE}"
-  --temperature "${TEMPERATURE}"
-  --top-k "${TOP_K}"
-  --top-p "${TOP_P}"
-  --seed "${SEED}"
-  --warmup "${WARMUP}"
-  --repeats "${REPEATS}"
 )
 
+if [[ -n "${BLOCK_ALIGNMENT:-}" ]]; then
+  ARGS+=(--block-alignment "${BLOCK_ALIGNMENT}")
+fi
 if [[ -n "${MODEL_PATH}" ]]; then
   ARGS+=(--model-path "${MODEL_PATH}")
 fi
-if [[ "${USE_CHAT_TEMPLATE}" == "1" ]]; then
-  ARGS+=(--use-chat-template)
+if [[ -n "${INFERENCE_CONFIG:-}" ]]; then
+  ARGS+=(--config-yaml "${INFERENCE_CONFIG}")
 else
-  ARGS+=(--no-use-chat-template)
-fi
-if [[ "${ENABLE_THINKING}" == "1" ]]; then
-  ARGS+=(--enable-thinking)
-fi
-if [[ "${IGNORE_EOS}" == "1" ]]; then
-  ARGS+=(--ignore-eos)
-fi
-if [[ "${PAPER_ALIGNED:-1}" == "1" ]]; then
-  ARGS+=(--paper-aligned)
-else
-  ARGS+=(--no-paper-aligned)
+  ARGS+=(
+    --block-sizes "${BLOCK_SIZES}"
+    --thresholds "${THRESHOLDS}"
+    --steps-per-block "${STEPS_PER_BLOCK}"
+    --max-new-tokens "${MAX_NEW_TOKENS}"
+    --seed-mode "${SEED_MODE}"
+    --temperature "${TEMPERATURE}"
+    --top-k "${TOP_K}"
+    --top-p "${TOP_P}"
+    --seed "${SEED}"
+    --warmup "${WARMUP}"
+    --repeats "${REPEATS}"
+  )
+  if [[ "${USE_CHAT_TEMPLATE}" == "1" ]]; then
+    ARGS+=(--use-chat-template)
+  else
+    ARGS+=(--no-use-chat-template)
+  fi
+  if [[ "${ENABLE_THINKING}" == "1" ]]; then
+    ARGS+=(--enable-thinking)
+  fi
+  if [[ "${IGNORE_EOS}" == "1" ]]; then
+    ARGS+=(--ignore-eos)
+  fi
+  if [[ "${PAPER_ALIGNED:-1}" == "1" ]]; then
+    ARGS+=(--paper-aligned)
+  else
+    ARGS+=(--no-paper-aligned)
+  fi
 fi
 
 echo "Checkpoint : ${CHECKPOINT_PATH}"
 echo "Base model : ${MODEL_PATH:-auto from dopd_config.json}"
-echo "Blocks     : ${BLOCK_SIZES}"
-echo "Thresholds : ${THRESHOLDS}"
-echo "Paper mode : ${PAPER_ALIGNED:-1}"
-echo "Decoder    : response-aligned all-MASK blocks, ${STEPS_PER_BLOCK} steps/block"
-echo "Sampling   : temperature=${TEMPERATURE}, top-k=${TOP_K}, top-p=${TOP_P}"
+echo "Alignment  : ${BLOCK_ALIGNMENT:-from decoder configuration}"
+if [[ -n "${INFERENCE_CONFIG:-}" ]]; then
+  echo "Config     : ${INFERENCE_CONFIG}"
+else
+  echo "Blocks     : ${BLOCK_SIZES}"
+  echo "Thresholds : ${THRESHOLDS}"
+  echo "Paper mode : ${PAPER_ALIGNED:-1}"
+  echo "Steps/block: ${STEPS_PER_BLOCK}"
+  echo "Sampling   : temperature=${TEMPERATURE}, top-k=${TOP_K}, top-p=${TOP_P}"
+fi
 echo "Output     : ${OUTPUT_JSON}"
 echo "Log        : ${LOG_PATH}"
 

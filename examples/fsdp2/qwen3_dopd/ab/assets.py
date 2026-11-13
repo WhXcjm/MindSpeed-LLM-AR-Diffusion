@@ -124,7 +124,14 @@ def prepare(source, destination):
     print(f"Prepared train and HF evaluation views with the same source weights: {destination}")
 
 
-def checkpoint_info(checkpoint, expected_iteration, loss_mask_mode, block_alignment):
+def checkpoint_info(
+    checkpoint,
+    expected_iteration,
+    loss_mask_mode,
+    block_alignment,
+    reconstruct_block_alignment=None,
+    exclude_eos_from_loss=None,
+):
     import torch
     from torch.distributed.checkpoint import FileSystemReader
 
@@ -158,14 +165,34 @@ def checkpoint_info(checkpoint, expected_iteration, loss_mask_mode, block_alignm
     }
     if any(state.get(key) != expected for key, expected in settings.items()):
         raise ValueError(f"Unexpected training settings in {extra}: expected {settings}")
-    return {
+    expected_reconstruct_alignment = (
+        block_alignment if reconstruct_block_alignment is None else reconstruct_block_alignment
+    )
+    saved_reconstruct_alignment = state.get("reconstruct_block_alignment", state["block_alignment"])
+    if saved_reconstruct_alignment != expected_reconstruct_alignment:
+        raise ValueError(
+            f"Expected reconstruct_block_alignment={expected_reconstruct_alignment} "
+            f"in {extra}, got {saved_reconstruct_alignment}"
+        )
+    saved_exclude_eos = state.get("exclude_eos_from_loss")
+    effective_exclude_eos = True if saved_exclude_eos is None else saved_exclude_eos
+    if exclude_eos_from_loss is not None and effective_exclude_eos != exclude_eos_from_loss:
+        raise ValueError(
+            f"Expected exclude_eos_from_loss={exclude_eos_from_loss} "
+            f"in {extra}, got {saved_exclude_eos}"
+        )
+    info = {
         "checkpoint": str(checkpoint),
         "global_step": iteration,
         "optimizer_step": optimizer_step,
         **settings,
+        "reconstruct_block_alignment": saved_reconstruct_alignment,
         "metadata_sha256": sha256_file(metadata),
         "rank0_extra_state_sha256": sha256_file(extra),
     }
+    if saved_exclude_eos is not None:
+        info["exclude_eos_from_loss"] = saved_exclude_eos
+    return info
 
 
 def main():
@@ -179,11 +206,20 @@ def main():
     ckpt.add_argument("--iteration", type=int, default=50)
     ckpt.add_argument("--loss-mask-mode", required=True, choices=("newly_unmasked", "remaining_mask"))
     ckpt.add_argument("--block-alignment", required=True, choices=("response", "prompt"))
+    ckpt.add_argument("--reconstruct-block-alignment", choices=("response", "prompt"))
+    ckpt.add_argument("--exclude-eos-from-loss", choices=("true", "false"))
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.source, args.destination)
     else:
-        info = checkpoint_info(args.checkpoint, args.iteration, args.loss_mask_mode, args.block_alignment)
+        info = checkpoint_info(
+            args.checkpoint,
+            args.iteration,
+            args.loss_mask_mode,
+            args.block_alignment,
+            args.reconstruct_block_alignment,
+            None if args.exclude_eos_from_loss is None else args.exclude_eos_from_loss == "true",
+        )
         print(json.dumps(info, ensure_ascii=False, indent=2))
 
 

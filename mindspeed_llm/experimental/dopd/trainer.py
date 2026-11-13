@@ -277,11 +277,11 @@ class DOPDTrainer:
         self.student.mask_token_id = self.mask_token_id
         self.student.config.mask_token_id = self.mask_token_id
         max_positions = getattr(self.student.config, "max_position_embeddings", None)
-        # 训练输入按 [提示词, 干净回答, 加噪回答] 拼接。
+        # 重建输入为 [提示词, 干净回答, 加噪回答]，prompt 对齐时另复制提示词尾部。
         requested_context = (
             self.dopd_args.prompt_tokens + 2 * self.dopd_args.max_response_tokens
         )
-        if self.dopd_args.block_alignment == "prompt":
+        if self.dopd_args.resolved_reconstruct_block_alignment == "prompt":
             requested_context += self.dopd_args.block_size - 1
         if max_positions is not None and requested_context > int(max_positions):
             raise ValueError(
@@ -340,8 +340,12 @@ class DOPDTrainer:
 
         if self.rank == 0:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            run_config = asdict(self.root_args)
+            run_config["dopd"]["reconstruct_block_alignment"] = (
+                self.dopd_args.resolved_reconstruct_block_alignment
+            )
             with (self.output_dir / "dopd_config.json").open("w", encoding="utf-8") as stream:
-                json.dump(asdict(self.root_args), stream, indent=2, ensure_ascii=False)
+                json.dump(run_config, stream, indent=2, ensure_ascii=False)
             if self.opdlm_preprocessing_report is not None:
                 with (self.output_dir / "opdlm_preprocessing_report.json").open(
                     "w", encoding="utf-8"
@@ -449,7 +453,6 @@ class DOPDTrainer:
             "loss_top_k": 16,
             "require_visible_future": True,
             "correctness_gate": True,
-            "exclude_eos_from_loss": True,
             "score_chunk_size": 128,
             "teacher_cache_max_bytes": 17179869184,
         }
@@ -560,6 +563,15 @@ class DOPDTrainer:
         ):
             if extra.get(name, legacy_value) != getattr(self.dopd_args, name):
                 raise ValueError(f"resume checkpoint does not match dopd.{name}")
+        saved_reconstruct_alignment = extra.get(
+            "reconstruct_block_alignment", extra.get("block_alignment", "response")
+        )
+        if saved_reconstruct_alignment != self.dopd_args.resolved_reconstruct_block_alignment:
+            raise ValueError("resume checkpoint does not match dopd.reconstruct_block_alignment")
+        if extra.get(
+            "exclude_eos_from_loss", self.dopd_args.exclude_eos_from_loss
+        ) != self.dopd_args.exclude_eos_from_loss:
+            raise ValueError("resume checkpoint does not match dopd.exclude_eos_from_loss")
         if extra.get("max_steps", self.training_args.max_steps) != self.training_args.max_steps:
             raise ValueError("resume checkpoint does not match training.max_steps")
         saved_inner_steps = extra.get("inner_steps_per_iteration", self.inner_steps_per_iteration)
@@ -880,6 +892,7 @@ class DOPDTrainer:
                 response_end = int(eos_positions[0].item()) + 1
                 response = response[:, :response_end]
                 first_unmask_steps = first_unmask_steps[:, :response_end]
+        reconstruct_alignment = self.dopd_args.resolved_reconstruct_block_alignment
         state = sample_intermediate_state(
             response[0],
             first_unmask_steps[0],
@@ -887,7 +900,7 @@ class DOPDTrainer:
             self.mask_token_id,
             random.Random(seed + 17),
             prompt_length=prompt.shape[1],
-            block_alignment=self.dopd_args.block_alignment,
+            block_alignment=reconstruct_alignment,
             loss_mask_mode=self.dopd_args.loss_mask_mode,
         )
         valid = response_valid_mask(
@@ -930,7 +943,7 @@ class DOPDTrainer:
             score_chunk_size=self.dopd_args.score_chunk_size,
             cache_max_bytes=self.dopd_args.teacher_cache_max_bytes,
             future_valid_length=int(future_valid.sum().item()),
-            block_alignment=self.dopd_args.block_alignment,
+            block_alignment=reconstruct_alignment,
         )
         return loss, stats, verification
 
@@ -939,6 +952,7 @@ class DOPDTrainer:
         if final:
             name = f"global_step_{self.global_step}_final"
         path = self.output_dir / "checkpoints" / name
+        reconstruct_alignment = self.dopd_args.resolved_reconstruct_block_alignment
         state = {
             "model": self.student_engine,
             "optimizer": self.optimizer,
@@ -949,7 +963,9 @@ class DOPDTrainer:
                 "lr_scheduler": self.scheduler.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
                 "block_alignment": self.dopd_args.block_alignment,
+                "reconstruct_block_alignment": reconstruct_alignment,
                 "loss_mask_mode": self.dopd_args.loss_mask_mode,
+                "exclude_eos_from_loss": self.dopd_args.exclude_eos_from_loss,
                 "max_steps": self.training_args.max_steps,
                 "inner_steps_per_iteration": self.inner_steps_per_iteration,
             },

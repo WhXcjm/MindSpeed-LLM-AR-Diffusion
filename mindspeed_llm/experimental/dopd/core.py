@@ -154,11 +154,12 @@ def sample_intermediate_state(
     block_alignment: str = "response",
     loss_mask_mode: str = "newly_unmasked",
 ) -> IntermediateState:
-    """Uniformly select one valid rollout round independently for each block.
+    """Uniformly select one reveal round independently for each reconstruction block.
 
     At reveal step ``s``, tokens revealed before ``s`` are visible, while tokens
     first revealed at or after ``s`` remain masked. The loss can supervise all
-    these positions or the positions revealed in round ``s`` only.
+    these positions or the positions revealed in round ``s`` only. The block
+    spans use the reconstruction alignment and the reveal times come from rollout.
     """
 
     if response_ids.ndim != 1 or first_unmask_steps.ndim != 1:
