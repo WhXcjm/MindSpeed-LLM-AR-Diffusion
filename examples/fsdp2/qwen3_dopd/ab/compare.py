@@ -111,7 +111,7 @@ def main():
         conditional_text = f"{conditional:.1%}" if conditional is not None else "n/a"
         print(
             f"{group:<16} {budgets['256']['accuracy']:>8.1%} {full['accuracy']:>9.1%} "
-            f"{full['normal_end_rate']:>9.1%} {conditional_text:>8} {full['generated_tokens_median']:>10:g}"
+            f"{full['normal_end_rate']:>9.1%} {conditional_text:>8} {full['generated_tokens_median']:>10g}"
         )
     print(f"AR exact output/stop matches: {result['ar_parity']['exact_raw_response_and_stop_match_count']}/{result['n']}")
     print(f"Paired results: {args.output}")
