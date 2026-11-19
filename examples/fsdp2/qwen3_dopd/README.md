@@ -65,14 +65,24 @@ bash examples/fsdp2/qwen3_dopd/train_dopd_qwen3_1.7b_fsdp2_A2.sh
 
 前 10 个外层迭代的 128 条全局 rollout 会逐条写入 `$OUTPUT_DIR/rollout_audits/iteration_0001.jsonl` 到 `iteration_0010.jsonl`。每条记录含原始问题、完整模型回答、是否生成 EOS、是否撞到长度上限、gold answer、verifier 是否适用、正确与否、答案提取结果，以及代码任务的 return code/stdout/stderr 尾部。聚合失败原因写入同目录的 `summary.jsonl`。
 
-为了直接比较论文训练过程中的多步 checkpoint，训练会保留：
+六份配置都每 50 个外层轮次留一份完整历史档，并在本次训练终点保存完整 `latest`。483 轮训练的目录如下：
 
 ```text
-global_step_50, 100, 150, 200, 250, 300, 350, 400, 450,
-global_step_483_final
+checkpoints/global_step_50, ..., checkpoints/global_step_450
+latest/global_step_483
 ```
 
-共 10 份，不会再被 `save_total_limit: 1` 清掉。请使用新的默认输出目录；若目录里已有 checkpoints，训练器会拒绝覆盖。
+历史档由 `training.save_steps`、`training.save_only_model` 和 `training.save_total_limit` 控制。间隔为 `0` 时关闭历史档。已有轮次目录会拒绝覆盖。`save_total_limit` 只清理历史档。
+
+`dopd.save_latest_steps: null` 关闭滚动保存，`0` 只在终点保存，正整数按间隔和终点保存。终点是 `max_steps` 或 `stop_after_iteration`。用 `dopd.save_latest_only_model` 单独选择是否只存模型。两种策略在同一轮触发时会各写一份。
+
+新版本通过 DCP 校验后才在共享文件系统上发布，随后清理旧版本。续训和推理可直接传入 `<output_dir>/latest`。导出用下面的命令，通过同一入口读取最高的已发布轮次。也可传具体版本目录或已有的 `global_step_*_final`。模型档可推理和导出，续训要求完整状态。
+
+```bash
+export PYTHONPATH="${PYTHONPATH:-}"
+source examples/fsdp2/env_config.sh
+python examples/fsdp2/qwen3_dopd/ab/assets.py export-weights /path/to/run/latest /path/to/hf_export
+```
 
 ## 实验配置
 
@@ -105,7 +115,7 @@ torchrun --standalone --nproc_per_node=8 train_dopd_fsdp2.py \
 本地单条 DCP 推理可显式读取同一份 YAML。直接调用 Python 推理入口时，也可从 checkpoint 对应的 `dopd_config.json` 自动读取推理设置，命令行参数优先。输出 JSON 中的 `ar_result` 记录 AR 回答，`results` 记录扩散回答和轨迹。
 
 ```bash
-CHECKPOINT_PATH=/path/to/run/checkpoints/global_step_483_final \
+CHECKPOINT_PATH=/path/to/run/latest \
 INFERENCE_CONFIG='examples/fsdp2/qwen3_dopd/dopd_qwen3_1.7b_fsdp2_A2_official(PRP).yaml' \
   bash examples/fsdp2/qwen3_dopd/inference_dopd_qwen3_1.7b_fsdp2_A2.sh
 ```

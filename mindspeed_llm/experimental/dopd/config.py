@@ -82,7 +82,15 @@ class DOPDArguments:
     )
     stop_after_iteration: Optional[int] = field(
         default=None,
-        metadata={"help": "Save and stop after this outer iteration without changing the training horizon."},
+        metadata={"help": "Stop after this outer iteration without changing the training horizon."},
+    )
+    save_latest_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Rolling checkpoint interval: null disables, 0 saves only at the endpoint."},
+    )
+    save_latest_only_model: bool = field(
+        default=False,
+        metadata={"help": "Omit optimizer and training state from rolling checkpoints."},
     )
     denoise_steps: int = field(default=4, metadata={"help": "Denoising steps per generated block."})
     temperature: float = field(default=1.0, metadata={"help": "Rollout sampling temperature."})
@@ -192,6 +200,10 @@ class DOPDArguments:
             type(self.stop_after_iteration) is not int or self.stop_after_iteration <= 0
         ):
             raise ValueError("dopd.stop_after_iteration must be a positive integer or null")
+        if self.save_latest_steps is not None and (
+            type(self.save_latest_steps) is not int or self.save_latest_steps < 0
+        ):
+            raise ValueError("dopd.save_latest_steps must be a non-negative integer or null")
         if self.min_response_tokens > self.max_response_tokens:
             raise ValueError("dopd.min_response_tokens cannot exceed dopd.max_response_tokens")
         if self.temperature < 0:

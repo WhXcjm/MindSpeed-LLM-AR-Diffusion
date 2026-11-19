@@ -17,7 +17,7 @@ Training container:
   prepare
   train baseline|combined|kl_only|prompt_only|kl+prompt|EOS_loss_only|official
   export GROUP
-  resume GROUP [iteration (default 50)]
+  resume GROUP [iteration (default 50) | latest]
 
 Evaluation container:
   eval original-ar|init-ar|init-diffusion|baseline50|combined50 [--limit N] [--block-alignment response|prompt]
@@ -80,14 +80,23 @@ PY
     ckpt50="$train_dir/checkpoints/global_step_50"
 }
 
+checkpoint_assets() {
+    TRAINING_BACKEND=mindspeed_fsdp PYTHONPATH="$TRAIN_REPO${PYTHONPATH:+:$PYTHONPATH}" \
+        python "$AB_DIR/assets.py" "$@"
+}
+
 inspect_checkpoint() {
-    python "$AB_DIR/assets.py" checkpoint-info "$1" --iteration "$2" \
+    local checkpoint=$1 iteration=$2
+    shift 2
+    local -a expected=()
+    [[ -z "$iteration" ]] || expected=(--iteration "$iteration")
+    checkpoint_assets checkpoint-info "$checkpoint" "${expected[@]}" "$@" \
         --loss-mask-mode "$loss_mode" --block-alignment "$alignment" \
         --reconstruct-block-alignment "$reconstruct_alignment" --exclude-eos-from-loss "$exclude_eos"
 }
 
 run_training() {
-    local action=$1 iteration=${2:-50} checkpoint existing step log
+    local action=$1 iteration=${2:-50} checkpoint existing step log info
     local -a stopping
     [[ -r "$MODELS/a2d-init/config.json" ]] || fail "Run prepare in the training container first."
     [[ -r "$OPDLM_TRAIN_DATA" ]] || fail "Cannot read OPDLM training data: $OPDLM_TRAIN_DATA"
@@ -98,11 +107,19 @@ run_training() {
         [[ ! -e "$train_dir" ]] || fail "Training directory already exists: $train_dir"
         stopping=(--dopd.stop_after_iteration=50)
     else
-        [[ "$iteration" =~ ^[1-9][0-9]{0,2}$ ]] && (( iteration >= 50 && iteration < 483 && iteration % 50 == 0 )) \
-            || fail "Resume iteration must be one of 50, 100, ..., 450."
-        checkpoint="$train_dir/checkpoints/global_step_$iteration"
-        inspect_checkpoint "$checkpoint" "$iteration"
-        for existing in "$train_dir"/checkpoints/global_step_*; do
+        if [[ "$iteration" == latest ]]; then
+            checkpoint="$train_dir/latest"
+            info=$(inspect_checkpoint "$checkpoint" "")
+            iteration=$(python -c 'import json, sys; print(json.load(sys.stdin)["global_step"])' <<< "$info")
+            (( iteration < 483 )) || fail "The latest checkpoint already reached the training horizon."
+        else
+            [[ "$iteration" =~ ^[1-9][0-9]{0,2}$ ]] && (( iteration >= 50 && iteration < 483 && iteration % 50 == 0 )) \
+                || fail "Resume iteration must be one of 50, 100, ..., 450, or latest."
+            checkpoint="$train_dir/checkpoints/global_step_$iteration"
+            inspect_checkpoint "$checkpoint" "$iteration"
+        fi
+        for existing in "$train_dir"/{checkpoints,latest}/global_step_*; do
+            [[ -f "$existing/.metadata" ]] || continue
             step=${existing##*/global_step_}
             step=${step%_final}
             if [[ "$step" =~ ^[0-9]+$ ]] && (( step > iteration )); then
@@ -124,7 +141,7 @@ run_training() {
         "--training.output_dir=$train_dir" \
         "${stopping[@]}" 2>&1 | tee "$log"
     if [[ "$action" == train ]]; then
-        inspect_checkpoint "$ckpt50" 50
+        inspect_checkpoint "$ckpt50" 50 --allow-model-only
     fi
 }
 
@@ -159,10 +176,9 @@ case "$COMMAND" in
         [[ ! -e "$destination" ]] || fail "Export already exists: $destination"
         mkdir -p -- "$export_root"
         stage=$(mktemp -d "$export_root/.${group}50.XXXXXX")
-        inspect_checkpoint "$ckpt50" 50 > "$stage/source_dcp.json"
+        inspect_checkpoint "$ckpt50" 50 --allow-model-only > "$stage/source_dcp.json"
         cd -- "$TRAIN_REPO"
-        python mindspeed_llm/fsdp2/checkpoint/merge_dcp_to_hf.py \
-            --load-dir "$ckpt50" --save-dir "$stage"
+        checkpoint_assets export-weights "$ckpt50" "$stage"
         python "$EVAL_REPO/scripts/prepare_dopd_hf_checkpoint.py" \
             --source-model-dir "$MODELS/a2d-init-hf" --output-dir "$stage" --mask-token-id 151669
         mv -T -- "$stage" "$destination"

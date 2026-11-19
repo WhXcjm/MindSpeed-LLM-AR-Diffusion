@@ -70,7 +70,7 @@ bash examples/fsdp2/qwen3_dopd/ab/run.sh paths.env export combined
 
 两组都保留块内双向注意力、原训练数据、训练种子、教师、验证器和 483 轮训练日程。`stop_after_iteration=50` 控制何时停下来保存。每轮 128 条轨迹，优化器全局 batch 为 8，第 50 轮对应 800 次优化器更新。成功的 `train` 命令会检查检查点记录与本组参数。
 
-完整 DCP 位于 `$RUN_ROOT/train/<组>/checkpoints/global_step_50`，含模型、优化器、调度器和迭代状态。供评测加载的 HF 权重位于 `$RUN_ROOT/exports/<组>50`，其中 `source_dcp.json` 记录来源。续训使用完整 DCP。
+第 50 轮的历史档位于 `$RUN_ROOT/train/<组>/checkpoints/global_step_50`。默认保存模型、优化器、调度器和迭代状态，并在主动停下的第 50 轮另存一份完整 `latest`。供评测加载的 HF 权重位于 `$RUN_ROOT/exports/<组>50`，其中 `source_dcp.json` 记录来源。历史档配置为仅模型时仍可导出。`resume GROUP latest` 可选择滚动档，续训要求完整 DCP。
 
 ## 5. 评测两个训练组并汇总
 

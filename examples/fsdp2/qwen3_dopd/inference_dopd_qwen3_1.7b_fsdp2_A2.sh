@@ -27,7 +27,10 @@ NODE_RANK=0
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-/mnt/pipeline-data/f50058111/model_train/opd/qwen3_1.7b_dopd_paper_1node_8card_1019/checkpoints/global_step_50_final}
 MODEL_PATH=${MODEL_PATH:-}
 MASK_TOKEN_ID=${MASK_TOKEN_ID:-151669}
-RUN_DIR=$(dirname "$(dirname "${CHECKPOINT_PATH}")")
+RUN_DIR=$(dirname "${CHECKPOINT_PATH%/}")
+case "${RUN_DIR##*/}" in
+  checkpoints|latest) RUN_DIR=$(dirname "${RUN_DIR}") ;;
+esac
 OUTPUT_JSON=${OUTPUT_JSON:-${RUN_DIR}/dopd_decode_analysis.json}
 LOG_PATH=${LOG_PATH:-${RUN_DIR}/dopd_decode_analysis.log}
 

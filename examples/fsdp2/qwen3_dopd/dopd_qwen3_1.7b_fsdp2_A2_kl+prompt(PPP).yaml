@@ -60,7 +60,7 @@ training:
   min_lr: 1.0e-6
   num_train_epochs: 1.0
   max_steps: 483
-  # 保留论文评测使用的 50/100/.../450，以及最终 483 checkpoint。
+  # 每 50 轮独立保存一份完整历史检查点。
   save_steps: 50
   save_total_limit: 10
   save_only_model: false
@@ -74,6 +74,9 @@ optimization:
   chunk_loss_size: 0
 
 dopd:
+  # 仅在本次训练终点保存完整 latest。
+  save_latest_steps: 0
+  save_latest_only_model: false
   # 教师是普通自回归 Qwen3-1.7B，与 a2d-init 学生严格分开加载。
   teacher_model_name_or_path: /mnt/pipeline-data/f50058111/model_weights/Qwen3-1.7B
   student_checkpoint: null

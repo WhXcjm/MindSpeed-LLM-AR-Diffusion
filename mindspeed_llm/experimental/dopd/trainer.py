@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 import types
 from dataclasses import asdict, dataclass, field, fields
@@ -20,6 +21,15 @@ import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 from transformers import AutoConfig, AutoModelForCausalLM, Qwen3Config
 
+from mindspeed_llm.experimental.dopd.checkpoint import (
+    CHECKPOINT_META,
+    checkpoint_plan,
+    open_distributed_checkpoint,
+    publish_checkpoint,
+    rank_zero_result,
+    stage_checkpoint,
+    validate_dcp,
+)
 from mindspeed_llm.experimental.dopd.config import DOPDArguments
 from mindspeed_llm.experimental.dopd.core import (
     active_rank_training_schedule,
@@ -37,7 +47,6 @@ from mindspeed_llm.experimental.dopd.opdlm_data import (
 from mindspeed_llm.experimental.dopd.rollout import block_diffusion_rollout
 from mindspeed_llm.experimental.dopd.scoring import compute_dopd_loss
 from mindspeed_llm.fsdp2.checkpoint.checkpoint_manager import CheckpointManager
-from mindspeed_llm.fsdp2.checkpoint.utils import cleanup_old_checkpoints
 from mindspeed_llm.fsdp2.data.data_factory import DataFactory
 from mindspeed_llm.fsdp2.data.template import get_template_and_fix_tokenizer
 from mindspeed_llm.fsdp2.data.tokenizer import TokenizerFactory
@@ -185,7 +194,10 @@ class DOPDTrainer:
         self.output_dir = Path(self.training_args.output_dir)
         if (
             self.training_args.resume_from_checkpoint is None
-            and (self.output_dir / "checkpoints").exists()
+            and any(
+                (self.output_dir / name).exists() or (self.output_dir / name).is_symlink()
+                for name in ("checkpoints", "latest")
+            )
         ):
             raise FileExistsError(
                 f"{self.output_dir} already contains checkpoints; use a new output_dir or resume explicitly"
@@ -407,8 +419,8 @@ class DOPDTrainer:
         stop_after = self.dopd_args.stop_after_iteration
         if stop_after is not None and stop_after > self.training_args.max_steps:
             raise ValueError("dopd.stop_after_iteration cannot exceed training.max_steps")
-        if stop_after is not None and self.training_args.save_only_model:
-            raise ValueError("dopd.stop_after_iteration requires a complete training checkpoint")
+        if type(self.training_args.save_steps) is not int or self.training_args.save_steps < 0:
+            raise ValueError("training.save_steps must be a non-negative integer")
         if self.parallel_args.fsdp_size != self.world_size:
             raise ValueError("d-OPD requires parallel.fsdp_size=WORLD_SIZE")
         if self.dopd_args.strict_paper_alignment:
@@ -480,9 +492,6 @@ class DOPDTrainer:
             "lr_scheduler_type": "cosine",
             "min_lr": 1.0e-6,
             "max_steps": 483,
-            "save_steps": 50,
-            "save_total_limit": 10,
-            "save_only_model": False,
         }
         for name, expected in expected_training.items():
             actual = getattr(self.training_args, name)
@@ -553,7 +562,11 @@ class DOPDTrainer:
         if not path:
             return
         state = {"model": self.student_engine, "optimizer": self.optimizer, "extra_state": {}}
-        CheckpointManager.load(path, state)
+        with open_distributed_checkpoint(path) as checkpoint:
+            rank_zero_result(
+                lambda: validate_dcp(checkpoint, require_training=True, world_size=self.world_size)
+            )
+            CheckpointManager.load(str(checkpoint), state)
         extra = state.get("extra_state", {})
         if "global_step" not in extra or "lr_scheduler" not in extra:
             raise ValueError("resume_from_checkpoint requires a complete d-OPD training checkpoint")
@@ -947,45 +960,60 @@ class DOPDTrainer:
         )
         return loss, stats, verification
 
-    def _save(self, final: bool = False):
-        name = f"global_step_{self.global_step}"
-        if final:
-            name = f"global_step_{self.global_step}_final"
-        path = self.output_dir / "checkpoints" / name
-        reconstruct_alignment = self.dopd_args.resolved_reconstruct_block_alignment
-        state = {
-            "model": self.student_engine,
-            "optimizer": self.optimizer,
-            "extra_state": {
-                "global_step": self.global_step,
-                "optimizer_step": self.optimizer_step,
-                "data_batches_consumed": self.data_batches_consumed,
+    def _save(self, destination: str):
+        root = self.output_dir / destination
+        target = root / f"global_step_{self.global_step}"
+        rolling = destination == "latest"
+        only_model = (
+            self.dopd_args.save_latest_only_model if rolling else self.training_args.save_only_model
+        )
+        identity = {
+            "global_step": self.global_step,
+            "optimizer_step": self.optimizer_step,
+            "data_batches_consumed": self.data_batches_consumed,
+            "block_alignment": self.dopd_args.block_alignment,
+            "reconstruct_block_alignment": self.dopd_args.resolved_reconstruct_block_alignment,
+            "loss_mask_mode": self.dopd_args.loss_mask_mode,
+            "exclude_eos_from_loss": self.dopd_args.exclude_eos_from_loss,
+            "max_steps": self.training_args.max_steps,
+            "inner_steps_per_iteration": self.inner_steps_per_iteration,
+        }
+        state = {"model": self.student_engine}
+        if not only_model:
+            state["optimizer"] = self.optimizer
+            state["extra_state"] = {
+                **identity,
                 "lr_scheduler": self.scheduler.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
-                "block_alignment": self.dopd_args.block_alignment,
-                "reconstruct_block_alignment": reconstruct_alignment,
-                "loss_mask_mode": self.dopd_args.loss_mask_mode,
-                "exclude_eos_from_loss": self.dopd_args.exclude_eos_from_loss,
-                "max_steps": self.training_args.max_steps,
-                "inner_steps_per_iteration": self.inner_steps_per_iteration,
-            },
-        }
+            }
+        staging = rank_zero_result(lambda: stage_checkpoint(root, self.global_step))
+
+        def publish():
+            try:
+                meta = {**identity, "only_model": only_model, "world_size": self.world_size}
+                (staging / CHECKPOINT_META).write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                publish_checkpoint(
+                    staging, target, only_model=only_model, world_size=self.world_size,
+                    keep=1 if rolling else self.training_args.save_total_limit,
+                )
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+
         CheckpointManager.save(
-            path=str(path),
+            path=str(staging),
             state=state,
-            save_async=(
-                self.training_args.save_async
-                and self.global_step != self.dopd_args.stop_after_iteration
-            ),
-            save_only_model=self.training_args.save_only_model,
+            save_async=self.training_args.save_async,
+            save_only_model=only_model,
             global_steps=self.global_step,
         )
+        if self.training_args.save_async:
+            CheckpointManager.dcp_save_future.result()
+            CheckpointManager.dcp_save_future = None
         dist.barrier()
-        cleanup_old_checkpoints(
-            self.training_args,
-            self.data_args.data_shared_file_system,
-        )
-        logger.info_rank0(f"> Saved d-OPD checkpoint to {path}")
+        rank_zero_result(publish)
+        logger.info_rank0(f"> Saved d-OPD checkpoint to {target}")
 
     def train(self):
         stop_after = self.dopd_args.stop_after_iteration or self.training_args.max_steps
@@ -1157,12 +1185,12 @@ class DOPDTrainer:
                     with (self.output_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
-            if self.training_args.save_steps > 0 and self.global_step % self.training_args.save_steps == 0:
-                self._save()
+            for destination in checkpoint_plan(
+                self.global_step, stop_after, self.training_args.save_steps, self.dopd_args.save_latest_steps
+            ):
+                self._save(destination)
             _empty_cache()
 
-        if self.training_args.save_steps <= 0 or self.global_step % self.training_args.save_steps:
-            self._save(final=True)
         elapsed = time.time() - start_time
         if stop_after < self.training_args.max_steps:
             logger.info_rank0(

@@ -250,7 +250,7 @@ def _nested(mapping: dict[str, Any], *keys: str, default=None):
 
 
 def _run_dir(checkpoint: Path) -> Path:
-    if checkpoint.parent.name == "checkpoints":
+    if checkpoint.parent.name in ("checkpoints", "latest"):
         return checkpoint.parent.parent
     return checkpoint.parent
 
@@ -398,6 +398,7 @@ def initialize_and_load_model(
     model_path: Path,
     mask_token_id: int,
 ):
+    from mindspeed_llm.experimental.dopd.checkpoint import open_distributed_checkpoint
     from mindspeed_llm.experimental.dopd.trainer import _initialize
     from mindspeed_llm.fsdp2.checkpoint.checkpoint_manager import CheckpointManager
     from mindspeed_llm.fsdp2.data.tokenizer import TokenizerFactory
@@ -499,7 +500,9 @@ def initialize_and_load_model(
             clean_up_tokenization_spaces=False,
         )
 
-    CheckpointManager.load(str(checkpoint), {"model": engine})
+    with open_distributed_checkpoint(checkpoint) as resolved_checkpoint:
+        CheckpointManager.load(str(resolved_checkpoint), {"model": engine})
+    args.checkpoint = str(resolved_checkpoint)
 
     vocab_size = int(model.config.vocab_size)
     if not 0 <= mask_token_id < vocab_size:
@@ -1169,6 +1172,7 @@ def main() -> int:
     model, tokenizer, device, base_causal_sanity = initialize_and_load_model(
         args, run_config, checkpoint, model_path, mask_token_id
     )
+    checkpoint = Path(args.checkpoint)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if rank == 0:

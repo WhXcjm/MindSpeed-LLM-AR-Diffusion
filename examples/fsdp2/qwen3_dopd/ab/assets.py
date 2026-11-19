@@ -1,4 +1,4 @@
-"""Prepare Qwen3 checkpoint views and inspect the full DCP used by the A/B run."""
+"""Prepare Qwen3 model views and inspect or export d-OPD checkpoints."""
 
 import argparse
 import hashlib
@@ -131,32 +131,43 @@ def checkpoint_info(
     block_alignment,
     reconstruct_block_alignment=None,
     exclude_eos_from_loss=None,
+    *,
+    allow_model_only=False,
+):
+    from mindspeed_llm.experimental.dopd.checkpoint import open_checkpoint
+
+    with open_checkpoint(checkpoint) as path:
+        return _checkpoint_info(
+            path, expected_iteration, loss_mask_mode, block_alignment,
+            reconstruct_block_alignment, exclude_eos_from_loss, allow_model_only,
+        )
+
+
+def _checkpoint_info(
+    checkpoint, expected_iteration, loss_mask_mode, block_alignment,
+    reconstruct_block_alignment, exclude_eos_from_loss, allow_model_only,
 ):
     import torch
-    from torch.distributed.checkpoint import FileSystemReader
+    from mindspeed_llm.experimental.dopd.checkpoint import CHECKPOINT_META, validate_dcp
 
-    checkpoint = checkpoint.resolve(strict=True)
     metadata = checkpoint / ".metadata"
     extra = checkpoint / "extra_state" / "extra_state_rank_0.pt"
-    if not metadata.is_file() or any(
-        not (extra.parent / f"extra_state_rank_{rank}.pt").is_file() for rank in range(8)
-    ):
-        raise ValueError(f"Full DCP metadata and eight rank states required: {checkpoint}")
-    dcp = FileSystemReader(checkpoint).read_metadata()
-    if not all(any(key.startswith(prefix) for key in dcp.state_dict_metadata) for prefix in ("model.", "optimizer.")):
-        raise ValueError(f"Missing model or optimizer state in {metadata}")
-    if not dcp.storage_data or any(
-        not (checkpoint / entry.relative_path).is_file() for entry in dcp.storage_data.values()
-    ):
-        raise ValueError(f"Missing DCP shards in {checkpoint}")
-    # This reader is only used on the experiment's own trusted checkpoint.
-    state = torch.load(extra, map_location="cpu", weights_only=False)
+    meta = checkpoint / CHECKPOINT_META
+    only_model = allow_model_only and not extra.is_file()
+    validate_dcp(checkpoint, require_training=not only_model, world_size=8)
+    if only_model:
+        state = read_json(meta)
+        if state.get("only_model") is not True:
+            raise ValueError(f"Missing model-only checkpoint identity in {meta}")
+    else:
+        state = torch.load(extra, map_location="cpu", weights_only=False)
+        if not isinstance(state.get("lr_scheduler"), dict):
+            raise ValueError(f"No scheduler state in {extra}")
+    source = meta if only_model else extra
     iteration = int(state["global_step"])
     optimizer_step = int(state["optimizer_step"])
-    if iteration != expected_iteration or optimizer_step != expected_iteration * 16:
-        raise ValueError(f"Expected iteration {expected_iteration} with {expected_iteration * 16} updates; got {iteration}/{optimizer_step}")
-    if not isinstance(state.get("lr_scheduler"), dict):
-        raise ValueError(f"No scheduler state in {extra}")
+    if (expected_iteration is not None and iteration != expected_iteration) or optimizer_step != iteration * 16:
+        raise ValueError(f"Unexpected iteration/update count in {source}: {iteration}/{optimizer_step}")
     settings = {
         "loss_mask_mode": loss_mask_mode,
         "block_alignment": block_alignment,
@@ -164,7 +175,7 @@ def checkpoint_info(
         "inner_steps_per_iteration": 16,
     }
     if any(state.get(key) != expected for key, expected in settings.items()):
-        raise ValueError(f"Unexpected training settings in {extra}: expected {settings}")
+        raise ValueError(f"Unexpected training settings in {source}: expected {settings}")
     expected_reconstruct_alignment = (
         block_alignment if reconstruct_block_alignment is None else reconstruct_block_alignment
     )
@@ -172,14 +183,14 @@ def checkpoint_info(
     if saved_reconstruct_alignment != expected_reconstruct_alignment:
         raise ValueError(
             f"Expected reconstruct_block_alignment={expected_reconstruct_alignment} "
-            f"in {extra}, got {saved_reconstruct_alignment}"
+            f"in {source}, got {saved_reconstruct_alignment}"
         )
     saved_exclude_eos = state.get("exclude_eos_from_loss")
     effective_exclude_eos = True if saved_exclude_eos is None else saved_exclude_eos
     if exclude_eos_from_loss is not None and effective_exclude_eos != exclude_eos_from_loss:
         raise ValueError(
             f"Expected exclude_eos_from_loss={exclude_eos_from_loss} "
-            f"in {extra}, got {saved_exclude_eos}"
+            f"in {source}, got {saved_exclude_eos}"
         )
     info = {
         "checkpoint": str(checkpoint),
@@ -188,11 +199,24 @@ def checkpoint_info(
         **settings,
         "reconstruct_block_alignment": saved_reconstruct_alignment,
         "metadata_sha256": sha256_file(metadata),
-        "rank0_extra_state_sha256": sha256_file(extra),
+        "only_model": only_model,
     }
+    if only_model:
+        info["checkpoint_meta_sha256"] = sha256_file(meta)
+    else:
+        info["rank0_extra_state_sha256"] = sha256_file(extra)
     if saved_exclude_eos is not None:
         info["exclude_eos_from_loss"] = saved_exclude_eos
     return info
+
+
+def export_weights(checkpoint, destination):
+    from mindspeed_llm.experimental.dopd.checkpoint import open_checkpoint, validate_dcp
+    from mindspeed_llm.fsdp2.checkpoint.merge_dcp_to_hf import merge_to_hf_pt
+
+    with open_checkpoint(checkpoint) as path:
+        validate_dcp(path)
+        merge_to_hf_pt(str(path), str(destination), shard_size=5_000_000_000)
 
 
 def main():
@@ -203,14 +227,20 @@ def main():
     prep.add_argument("destination", type=Path)
     ckpt = commands.add_parser("checkpoint-info")
     ckpt.add_argument("checkpoint", type=Path)
-    ckpt.add_argument("--iteration", type=int, default=50)
+    ckpt.add_argument("--iteration", type=int)
+    ckpt.add_argument("--allow-model-only", action="store_true")
     ckpt.add_argument("--loss-mask-mode", required=True, choices=("newly_unmasked", "remaining_mask"))
     ckpt.add_argument("--block-alignment", required=True, choices=("response", "prompt"))
     ckpt.add_argument("--reconstruct-block-alignment", choices=("response", "prompt"))
     ckpt.add_argument("--exclude-eos-from-loss", choices=("true", "false"))
+    export = commands.add_parser("export-weights")
+    export.add_argument("checkpoint", type=Path)
+    export.add_argument("destination", type=Path)
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.source, args.destination)
+    elif args.command == "export-weights":
+        export_weights(args.checkpoint, args.destination)
     else:
         info = checkpoint_info(
             args.checkpoint,
@@ -219,6 +249,7 @@ def main():
             args.block_alignment,
             args.reconstruct_block_alignment,
             None if args.exclude_eos_from_loss is None else args.exclude_eos_from_loss == "true",
+            allow_model_only=args.allow_model_only,
         )
         print(json.dumps(info, ensure_ascii=False, indent=2))
 
